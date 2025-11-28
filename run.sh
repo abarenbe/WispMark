@@ -1,2 +1,2 @@
 #!/bin/bash
-swiftc main.swift -o FloatMD && ./FloatMD
+swiftc main.swift -o FloatMD -framework Cocoa -framework Carbon && ./FloatMD
