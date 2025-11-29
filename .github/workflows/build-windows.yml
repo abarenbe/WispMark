@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'FloatMD-Windows/**'
+      - '.github/workflows/build-windows.yml'
   pull_request:
     branches: [main]
     paths:
