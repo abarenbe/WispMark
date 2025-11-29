@@ -205,6 +205,8 @@ class NotesManager {
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: FloatingPanel!
     var statusItem: NSStatusItem!
+    var searchField: NSSearchField!
+    var currentSearchQuery: String = ""
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         window = FloatingPanel(
@@ -215,7 +217,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         window.center()
-        window.setFrameAutosaveName("FloatMDWindow")
+        window.setFrameAutosaveName("FloatNoteWindow")
         window.level = .floating
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.isFloatingPanel = true
@@ -230,12 +232,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "doc.text", accessibilityDescription: "FloatMD")
+            // Load AppIcon from bundle and resize for menu bar
+            if let appIcon = NSImage(named: "AppIcon") {
+                appIcon.size = NSSize(width: 18, height: 18)
+                appIcon.isTemplate = true  // Adapts to light/dark menu bar
+                button.image = appIcon
+            } else {
+                // Fallback to SF Symbol if AppIcon not found
+                button.image = NSImage(systemSymbolName: "doc.text", accessibilityDescription: "FloatNote")
+            }
         }
 
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Quit FloatMD", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.delegate = self
         statusItem.menu = menu
+
+        // Create main menu bar with Edit menu for Undo/Redo support
+        let mainMenu = NSMenu()
+        NSApp.mainMenu = mainMenu
+
+        // Edit menu
+        let editMenu = NSMenu(title: "Edit")
+        let editMenuItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+        editMenuItem.submenu = editMenu
+
+        editMenu.addItem(NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z"))
+        editMenu.addItem(NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "Z"))
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        editMenu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        editMenu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+
+        mainMenu.addItem(editMenuItem)
 
         HotkeyManager.shared.register()
         checkAccessibilityPermissions()
@@ -247,9 +276,216 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !accessEnabled {
             let alert = NSAlert()
             alert.messageText = "Accessibility Permissions Needed"
-            alert.informativeText = "To inject text into other apps, FloatMD needs Accessibility permissions."
+            alert.informativeText = "To inject text into other apps, FloatNote needs Accessibility permissions."
             alert.addButton(withTitle: "OK")
             alert.runModal()
+        }
+    }
+
+    @objc func createNewNote() {
+        _ = NotesManager.shared.createNote()
+        if let mainView = window.contentView as? MainView {
+            mainView.loadActiveNote()
+        }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func selectNote(_ sender: NSMenuItem) {
+        guard let noteId = sender.representedObject as? UUID,
+              let note = NotesManager.shared.notes.first(where: { $0.id == noteId }) else { return }
+        NotesManager.shared.setActiveNote(note)
+        if let mainView = window.contentView as? MainView {
+            mainView.loadActiveNote()
+        }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func showWindow() {
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+extension AppDelegate: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        // Show window when menu opens
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        // New Note item
+        let newNoteItem = NSMenuItem(title: "New Note", action: #selector(createNewNote), keyEquivalent: "n")
+        newNoteItem.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)
+        menu.addItem(newNoteItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Search field
+        searchField = NSSearchField(frame: NSRect(x: 0, y: 0, width: 200, height: 24))
+        searchField.placeholderString = "Search notes..."
+        searchField.target = self
+        searchField.action = #selector(searchChanged(_:))
+        searchField.stringValue = currentSearchQuery
+        searchField.delegate = self
+        // Fire action on every keystroke
+        (searchField.cell as? NSSearchFieldCell)?.sendsSearchStringImmediately = true
+        (searchField.cell as? NSSearchFieldCell)?.sendsWholeSearchString = false
+        let searchItem = NSMenuItem()
+        searchItem.view = searchField
+        menu.addItem(searchItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Notes list (pinned first, then by modified date)
+        var notes = NotesManager.shared.notes.sorted {
+            if $0.isPinned != $1.isPinned { return $0.isPinned }
+            return $0.modifiedAt > $1.modifiedAt
+        }
+
+        // Filter by search query
+        if !currentSearchQuery.isEmpty {
+            let query = currentSearchQuery.lowercased()
+
+            // Check if searching for a tag (starts with #)
+            if query.hasPrefix("#") {
+                let tagQuery = String(query.dropFirst())  // Remove the #
+                if !tagQuery.isEmpty {
+                    // Filter notes that have a tag starting with the query
+                    let tagPattern = try? NSRegularExpression(pattern: "#\(NSRegularExpression.escapedPattern(for: tagQuery))[a-zA-Z0-9_-]*", options: .caseInsensitive)
+                    notes = notes.filter { note in
+                        if let pattern = tagPattern {
+                            let range = NSRange(location: 0, length: note.content.utf16.count)
+                            return pattern.firstMatch(in: note.content, options: [], range: range) != nil
+                        }
+                        return false
+                    }
+                }
+            } else {
+                // Regular text search
+                notes = notes.filter {
+                    $0.title.lowercased().contains(query) ||
+                    $0.content.lowercased().contains(query)
+                }
+            }
+        }
+
+        let activeId = NotesManager.shared.activeNote?.id
+
+        // Show 5 notes max
+        let displayLimit = 5
+
+        if notes.isEmpty && !currentSearchQuery.isEmpty {
+            let noResultsItem = NSMenuItem(title: "No results found", action: nil, keyEquivalent: "")
+            noResultsItem.isEnabled = false
+            menu.addItem(noResultsItem)
+        } else {
+            for note in notes.prefix(displayLimit) {
+                let title = note.title.isEmpty ? "Untitled" : note.title
+                let item = NSMenuItem(title: title, action: #selector(selectNote(_:)), keyEquivalent: "")
+                item.representedObject = note.id
+                if note.id == activeId {
+                    item.state = .on
+                }
+                if note.isPinned {
+                    item.image = NSImage(systemSymbolName: "pin.fill", accessibilityDescription: nil)
+                }
+                menu.addItem(item)
+            }
+        }
+
+        // Quit
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Quit FloatNote", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        currentSearchQuery = ""
+    }
+
+    @objc func searchChanged(_ sender: NSSearchField) {
+        currentSearchQuery = sender.stringValue
+        rebuildMenuItems()
+    }
+
+    private func rebuildMenuItems() {
+        guard let menu = statusItem.menu else { return }
+
+        // Remove all items except New Note (first) and separator (second) and search field (third)
+        while menu.items.count > 3 {
+            menu.removeItem(at: 3)
+        }
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Notes list (pinned first, then by modified date)
+        var notes = NotesManager.shared.notes.sorted {
+            if $0.isPinned != $1.isPinned { return $0.isPinned }
+            return $0.modifiedAt > $1.modifiedAt
+        }
+
+        // Filter by search query
+        if !currentSearchQuery.isEmpty {
+            let query = currentSearchQuery.lowercased()
+
+            // Check if searching for a tag (starts with #)
+            if query.hasPrefix("#") {
+                let tagQuery = String(query.dropFirst())
+                if !tagQuery.isEmpty {
+                    let tagPattern = try? NSRegularExpression(pattern: "#\(NSRegularExpression.escapedPattern(for: tagQuery))[a-zA-Z0-9_-]*", options: .caseInsensitive)
+                    notes = notes.filter { note in
+                        if let pattern = tagPattern {
+                            let range = NSRange(location: 0, length: note.content.utf16.count)
+                            return pattern.firstMatch(in: note.content, options: [], range: range) != nil
+                        }
+                        return false
+                    }
+                }
+            } else {
+                notes = notes.filter {
+                    $0.title.lowercased().contains(query) ||
+                    $0.content.lowercased().contains(query)
+                }
+            }
+        }
+
+        let activeId = NotesManager.shared.activeNote?.id
+        let displayLimit = 5
+
+        if notes.isEmpty && !currentSearchQuery.isEmpty {
+            let noResultsItem = NSMenuItem(title: "No results found", action: nil, keyEquivalent: "")
+            noResultsItem.isEnabled = false
+            menu.addItem(noResultsItem)
+        } else {
+            for note in notes.prefix(displayLimit) {
+                let title = note.title.isEmpty ? "Untitled" : note.title
+                let item = NSMenuItem(title: title, action: #selector(selectNote(_:)), keyEquivalent: "")
+                item.representedObject = note.id
+                if note.id == activeId {
+                    item.state = .on
+                }
+                if note.isPinned {
+                    item.image = NSImage(systemSymbolName: "pin.fill", accessibilityDescription: nil)
+                }
+                menu.addItem(item)
+            }
+        }
+
+        // Quit
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Quit FloatNote", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
+}
+
+extension AppDelegate: NSSearchFieldDelegate {
+    func controlTextDidChange(_ obj: Notification) {
+        if let field = obj.object as? NSSearchField {
+            currentSearchQuery = field.stringValue
+            rebuildMenuItems()
         }
     }
 }
@@ -712,7 +948,7 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         textView.isRichText = true
         textView.allowsUndo = true
         textView.textContainerInset = NSSize(width: 15, height: 15)
-        textView.insertionPointColor = .white
+        textView.insertionPointColor = theme.cursor
         textView.typingAttributes = [.font: baseFont, .foregroundColor: textColor]
         textView.textStorage?.delegate = self
 
@@ -1534,6 +1770,10 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
     }
 
     func getContent() -> String { textView.string }
+
+    func loadActiveNote() {
+        loadContent()
+    }
 }
 
 // MARK: - Tag Autocomplete View
@@ -2482,20 +2722,20 @@ extension NoteBrowserView: NSTableViewDelegate, NSTableViewDataSource {
 class InjectionSettings {
     static let shared = InjectionSettings()
 
-    private let ignoreTitlesKey = "FloatMD.InjectionSettings.IgnoreTitles"
-    private let ignoreTagsKey = "FloatMD.InjectionSettings.IgnoreTags"
-    private let ignoreLinkFormattingKey = "FloatMD.InjectionSettings.IgnoreLinkFormatting"
-    private let hotkeyDisplayKey = "FloatMD.InjectionSettings.HotkeyDisplay"
+    private let ignoreTitlesKey = "FloatNote.InjectionSettings.IgnoreTitles"
+    private let ignoreTagsKey = "FloatNote.InjectionSettings.IgnoreTags"
+    private let ignoreLinkFormattingKey = "FloatNote.InjectionSettings.IgnoreLinkFormatting"
+    private let hotkeyDisplayKey = "FloatNote.InjectionSettings.HotkeyDisplay"
 
     // Injection hotkey settings
-    private let injectionKeyCodeKey = "FloatMD.Hotkey.Injection.KeyCode"
-    private let injectionModifiersKey = "FloatMD.Hotkey.Injection.Modifiers"
-    private let injectionDisplayKey = "FloatMD.Hotkey.Injection.Display"
+    private let injectionKeyCodeKey = "FloatNote.Hotkey.Injection.KeyCode"
+    private let injectionModifiersKey = "FloatNote.Hotkey.Injection.Modifiers"
+    private let injectionDisplayKey = "FloatNote.Hotkey.Injection.Display"
 
     // Toggle hotkey settings
-    private let toggleKeyCodeKey = "FloatMD.Hotkey.Toggle.KeyCode"
-    private let toggleModifiersKey = "FloatMD.Hotkey.Toggle.Modifiers"
-    private let toggleDisplayKey = "FloatMD.Hotkey.Toggle.Display"
+    private let toggleKeyCodeKey = "FloatNote.Hotkey.Toggle.KeyCode"
+    private let toggleModifiersKey = "FloatNote.Hotkey.Toggle.Modifiers"
+    private let toggleDisplayKey = "FloatNote.Hotkey.Toggle.Display"
 
     var ignoreTitles: Bool {
         get { UserDefaults.standard.bool(forKey: ignoreTitlesKey) }
@@ -2631,6 +2871,7 @@ class HotkeyManager {
     static let shared = HotkeyManager()
     private var pasteHotkeyRef: EventHotKeyRef?
     private var toggleHotkeyRef: EventHotKeyRef?
+    private var newNoteHotkeyRef: EventHotKeyRef?
 
     func unregister() {
         // Unregister existing hotkeys
@@ -2642,7 +2883,11 @@ class HotkeyManager {
             UnregisterEventHotKey(toggleRef)
             toggleHotkeyRef = nil
         }
-        NSLog("FloatMD: Hotkeys unregistered")
+        if let newNoteRef = newNoteHotkeyRef {
+            UnregisterEventHotKey(newNoteRef)
+            newNoteHotkeyRef = nil
+        }
+        NSLog("FloatNote: Hotkeys unregistered")
     }
 
     func register() {
@@ -2662,7 +2907,7 @@ class HotkeyManager {
         )
 
         if status != noErr {
-            NSLog("FloatMD: ERROR - Failed to install event handler: \(status)")
+            NSLog("FloatNote: ERROR - Failed to install event handler: \(status)")
             return
         }
 
@@ -2682,9 +2927,9 @@ class HotkeyManager {
         )
 
         if pasteStatus == noErr {
-            NSLog("FloatMD: Global hotkey \(injectionDisplay) registered successfully (Carbon API)")
+            NSLog("FloatNote: Global hotkey \(injectionDisplay) registered successfully (Carbon API)")
         } else {
-            NSLog("FloatMD: ERROR - Failed to register injection hotkey: \(pasteStatus)")
+            NSLog("FloatNote: ERROR - Failed to register injection hotkey: \(pasteStatus)")
         }
 
         // Register hotkey 2: Toggle hotkey (read from settings)
@@ -2703,9 +2948,29 @@ class HotkeyManager {
         )
 
         if toggleStatus == noErr {
-            NSLog("FloatMD: Global hotkey \(toggleDisplay) registered successfully (Carbon API)")
+            NSLog("FloatNote: Global hotkey \(toggleDisplay) registered successfully (Carbon API)")
         } else {
-            NSLog("FloatMD: ERROR - Failed to register toggle hotkey: \(toggleStatus)")
+            NSLog("FloatNote: ERROR - Failed to register toggle hotkey: \(toggleStatus)")
+        }
+
+        // Register hotkey 3: New Note hotkey (Cmd+N)
+        let newNoteKeyCode: UInt32 = 45 // 'n' key
+        let newNoteModifiers: UInt32 = UInt32(cmdKey) // Cmd modifier
+
+        let newNoteHotKeyID = EventHotKeyID(signature: OSType(0x464D4420), id: 3) // "FMD " signature
+        let newNoteStatus = RegisterEventHotKey(
+            newNoteKeyCode,
+            newNoteModifiers,
+            newNoteHotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &newNoteHotkeyRef
+        )
+
+        if newNoteStatus == noErr {
+            NSLog("FloatNote: Global hotkey Cmd+N registered successfully (Carbon API)")
+        } else {
+            NSLog("FloatNote: ERROR - Failed to register new note hotkey: \(newNoteStatus)")
         }
     }
 
@@ -2714,20 +2979,22 @@ class HotkeyManager {
             handlePasteHotkey()
         } else if id == 2 {
             handleToggleHotkey()
+        } else if id == 3 {
+            handleNewNoteHotkey()
         }
     }
 
     func handlePasteHotkey() {
-        NSLog("FloatMD: Hotkey Opt+Cmd+I pressed!")
+        NSLog("FloatNote: Hotkey Opt+Cmd+I pressed!")
         guard let appDelegate = NSApp.delegate as? AppDelegate,
               let view = appDelegate.window.contentView as? MainView else {
-            NSLog("FloatMD: ERROR - Could not get MainView")
+            NSLog("FloatNote: ERROR - Could not get MainView")
             return
         }
 
         let rawContent = view.getContent()
         let content = InjectionSettings.shared.processContent(rawContent)
-        NSLog("FloatMD: Content to paste: \(content.prefix(50))...")
+        NSLog("FloatNote: Content to paste: \(content.prefix(50))...")
 
         // Visual feedback
         DispatchQueue.main.async {
@@ -2742,11 +3009,11 @@ class HotkeyManager {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(content, forType: .string)
-        NSLog("FloatMD: Content copied to clipboard")
+        NSLog("FloatNote: Content copied to clipboard")
 
         // Use CGEvent to simulate Cmd+V - more reliable than AppleScript
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            NSLog("FloatMD: Simulating Cmd+V paste...")
+            NSLog("FloatNote: Simulating Cmd+V paste...")
 
             // Create key down event for 'v' with command modifier
             let source = CGEventSource(stateID: .hidSystemState)
@@ -2763,33 +3030,54 @@ class HotkeyManager {
                 keyUp.post(tap: .cghidEventTap)
             }
 
-            NSLog("FloatMD: Paste event posted")
+            NSLog("FloatNote: Paste event posted")
         }
     }
 
     func handleToggleHotkey() {
-        NSLog("FloatMD: Hotkey Cmd+Shift+M pressed!")
+        NSLog("FloatNote: Hotkey Cmd+Shift+M pressed!")
         guard let appDelegate = NSApp.delegate as? AppDelegate else {
-            NSLog("FloatMD: ERROR - Could not get AppDelegate")
+            NSLog("FloatNote: ERROR - Could not get AppDelegate")
             return
         }
 
         DispatchQueue.main.async {
             guard let window = appDelegate.window else {
-                NSLog("FloatMD: ERROR - Window is nil")
+                NSLog("FloatNote: ERROR - Window is nil")
                 return
             }
 
             if window.isVisible && window.isKeyWindow {
                 // Window is visible and active - hide it
-                NSLog("FloatMD: Hiding window")
+                NSLog("FloatNote: Hiding window")
                 window.orderOut(nil)
             } else {
                 // Window is hidden or not key - bring it back
-                NSLog("FloatMD: Showing and activating window")
+                NSLog("FloatNote: Showing and activating window")
                 window.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
             }
+        }
+    }
+
+    func handleNewNoteHotkey() {
+        NSLog("FloatNote: Hotkey Cmd+N pressed!")
+        guard let appDelegate = NSApp.delegate as? AppDelegate else {
+            NSLog("FloatNote: ERROR - Could not get AppDelegate")
+            return
+        }
+
+        DispatchQueue.main.async {
+            // Create new note
+            _ = NotesManager.shared.createNote()
+            if let mainView = appDelegate.window.contentView as? MainView {
+                mainView.loadActiveNote()
+            }
+
+            // Show and activate window
+            appDelegate.window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            NSLog("FloatNote: New note created and window activated")
         }
     }
 }
