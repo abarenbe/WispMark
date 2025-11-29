@@ -150,8 +150,6 @@ export function parseMarkdown(content: string): MarkdownToken[] {
  * Parse a single line into tokens
  */
 function parseLine(line: string): MarkdownToken[] {
-  const tokens: MarkdownToken[] = [];
-
   // Check for heading
   const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
   if (headingMatch) {
