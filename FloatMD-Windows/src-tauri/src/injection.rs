@@ -4,30 +4,36 @@
 /// 2. Simulating Ctrl+V keypress using Windows SendInput API
 
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::*;
-#[cfg(target_os = "windows")]
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
-#[cfg(target_os = "windows")]
-use windows::Win32::System::DataExchange::*;
-#[cfg(target_os = "windows")]
-use windows::Win32::System::Memory::*;
+use std::ptr;
 
 #[cfg(target_os = "windows")]
-use std::ptr;
+use windows::Win32::Foundation::HWND;
+#[cfg(target_os = "windows")]
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, HGLOBAL};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, KEYBD_EVENT_FLAGS, VIRTUAL_KEY, VK_CONTROL,
+};
+
+/// CF_UNICODETEXT clipboard format
+#[cfg(target_os = "windows")]
+const CF_UNICODETEXT: u32 = 13;
 
 /// Set clipboard text on Windows
 #[cfg(target_os = "windows")]
 fn set_clipboard_text(text: &str) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         // Open clipboard
-        if !OpenClipboard(HWND(0)).as_bool() {
-            return Err("Failed to open clipboard".into());
-        }
+        OpenClipboard(HWND(ptr::null_mut()))?;
 
         // Empty clipboard
-        if !EmptyClipboard().as_bool() {
-            CloseClipboard().ok();
-            return Err("Failed to empty clipboard".into());
+        if let Err(e) = EmptyClipboard() {
+            let _ = CloseClipboard();
+            return Err(format!("Failed to empty clipboard: {}", e).into());
         }
 
         // Allocate global memory for text
@@ -35,31 +41,27 @@ fn set_clipboard_text(text: &str) -> Result<(), Box<dyn std::error::Error>> {
         let size = wide_text.len() * std::mem::size_of::<u16>();
 
         let hglob = GlobalAlloc(GMEM_MOVEABLE, size)?;
-        if hglob.is_invalid() {
-            CloseClipboard().ok();
-            return Err("Failed to allocate global memory".into());
-        }
 
         // Lock memory and copy text
         let locked = GlobalLock(hglob);
         if locked.is_null() {
-            GlobalFree(hglob).ok();
-            CloseClipboard().ok();
+            let _ = GlobalFree(hglob);
+            let _ = CloseClipboard();
             return Err("Failed to lock global memory".into());
         }
 
         ptr::copy_nonoverlapping(wide_text.as_ptr(), locked as *mut u16, wide_text.len());
-        GlobalUnlock(hglob).ok();
+        let _ = GlobalUnlock(hglob);
 
         // Set clipboard data
-        let result = SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hglob.0));
-        if result.is_invalid() {
-            GlobalFree(hglob).ok();
-            CloseClipboard().ok();
+        let result = SetClipboardData(CF_UNICODETEXT, windows::Win32::Foundation::HANDLE(hglob.0));
+        if result.is_err() {
+            let _ = GlobalFree(hglob);
+            let _ = CloseClipboard();
             return Err("Failed to set clipboard data".into());
         }
 
-        CloseClipboard().ok();
+        let _ = CloseClipboard();
         Ok(())
     }
 }
@@ -136,19 +138,19 @@ pub fn inject_text_command(text: String) -> Result<(), String> {
 #[tauri::command]
 pub fn get_clipboard_text() -> Result<String, String> {
     unsafe {
-        if !OpenClipboard(HWND(0)).as_bool() {
-            return Err("Failed to open clipboard".to_string());
-        }
+        OpenClipboard(HWND(ptr::null_mut())).map_err(|e| format!("Failed to open clipboard: {}", e))?;
 
-        let hglob = GetClipboardData(CF_UNICODETEXT.0 as u32);
-        if hglob.is_invalid() {
-            CloseClipboard().ok();
-            return Err("No text in clipboard".to_string());
-        }
+        let hglob = match GetClipboardData(CF_UNICODETEXT) {
+            Ok(h) => h,
+            Err(_) => {
+                let _ = CloseClipboard();
+                return Err("No text in clipboard".to_string());
+            }
+        };
 
         let locked = GlobalLock(HGLOBAL(hglob.0));
         if locked.is_null() {
-            CloseClipboard().ok();
+            let _ = CloseClipboard();
             return Err("Failed to lock clipboard data".to_string());
         }
 
@@ -161,8 +163,8 @@ pub fn get_clipboard_text() -> Result<String, String> {
         let slice = std::slice::from_raw_parts(wide_str, len as usize);
         let result = String::from_utf16_lossy(slice);
 
-        GlobalUnlock(HGLOBAL(hglob.0)).ok();
-        CloseClipboard().ok();
+        let _ = GlobalUnlock(HGLOBAL(hglob.0));
+        let _ = CloseClipboard();
 
         Ok(result)
     }
