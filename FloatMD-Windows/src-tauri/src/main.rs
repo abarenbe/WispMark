@@ -10,7 +10,7 @@ mod hotkeys;
 mod injection;
 
 use storage::{get_notes, save_notes_command, create_note, update_note, delete_note, get_storage_location};
-use hotkeys::{register_hotkeys, unregister_hotkeys, register_custom_hotkey};
+use hotkeys::{register_hotkeys, register_custom_hotkey};
 use injection::{inject_text_command, get_clipboard_text};
 
 /// Create system tray menu

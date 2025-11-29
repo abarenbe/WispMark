@@ -39,6 +39,7 @@ pub fn register_hotkeys(app: &AppHandle) -> Result<(), Box<dyn std::error::Error
 }
 
 /// Unregister all global hotkeys
+#[allow(dead_code)]
 pub fn unregister_hotkeys(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let toggle_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyM);
     let inject_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyI);
@@ -50,9 +51,9 @@ pub fn unregister_hotkeys(app: &AppHandle) -> Result<(), Box<dyn std::error::Err
 
 #[tauri::command]
 pub fn register_custom_hotkey(
-    app: AppHandle,
-    shortcut: String,
-    action: String,
+    _app: AppHandle,
+    _shortcut: String,
+    _action: String,
 ) -> Result<(), String> {
     // This allows the frontend to register custom hotkeys if needed
     // For now, we just return an error as custom hotkeys aren't implemented
