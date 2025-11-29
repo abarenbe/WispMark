@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Note, NoteWithComputed, enrichNote } from './models/Note';
 import { NotesManager } from './models/NotesManager';
@@ -16,7 +16,7 @@ function App() {
   const [theme, setTheme] = useState<Theme>(getTheme('Dark'));
 
   // Auto-save timer
-  const [saveTimeout, setSaveTimeout] = useState<NodeJS.Timeout | null>(null);
+  const [saveTimeout, setSaveTimeout] = useState<ReturnType<typeof setTimeout> | null>(null);
 
   // Load notes on mount
   useEffect(() => {

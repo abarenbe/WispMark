@@ -1,4 +1,4 @@
-import React from 'react';
+// React is imported implicitly via JSX transform
 import { NoteWithComputed } from '../models/Note';
 import { Theme } from '../themes';
 

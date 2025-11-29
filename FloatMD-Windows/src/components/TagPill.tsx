@@ -1,4 +1,4 @@
-import React from 'react';
+// React is imported implicitly via JSX transform
 
 export interface TagPillProps {
   tag: string;

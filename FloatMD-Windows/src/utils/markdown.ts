@@ -1,4 +1,4 @@
-import { MarkdownToken, TokenType } from '../types';
+import { MarkdownToken } from '../types';
 
 /**
  * Extract the title from markdown content (first non-empty line)
