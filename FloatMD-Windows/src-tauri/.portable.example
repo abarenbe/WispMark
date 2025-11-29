@@ -1,0 +1,9 @@
+# This is an example portable mode marker file
+#
+# To enable portable mode, rename this file to just ".portable" (without .example)
+# and place it in the same directory as the FloatMD.exe executable.
+#
+# When portable mode is enabled, notes.json will be stored in a "data" folder
+# next to the executable instead of in AppData.
+#
+# This allows you to run FloatMD from a USB drive or other portable storage.
