@@ -7,13 +7,13 @@
 use std::ptr;
 
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
 #[cfg(target_os = "windows")]
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 #[cfg(target_os = "windows")]
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, HGLOBAL};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, KEYBD_EVENT_FLAGS, VIRTUAL_KEY, VK_CONTROL,
@@ -45,7 +45,6 @@ fn set_clipboard_text(text: &str) -> Result<(), Box<dyn std::error::Error>> {
         // Lock memory and copy text
         let locked = GlobalLock(hglob);
         if locked.is_null() {
-            let _ = GlobalFree(hglob);
             let _ = CloseClipboard();
             return Err("Failed to lock global memory".into());
         }
@@ -54,9 +53,8 @@ fn set_clipboard_text(text: &str) -> Result<(), Box<dyn std::error::Error>> {
         let _ = GlobalUnlock(hglob);
 
         // Set clipboard data
-        let result = SetClipboardData(CF_UNICODETEXT, windows::Win32::Foundation::HANDLE(hglob.0));
+        let result = SetClipboardData(CF_UNICODETEXT, HANDLE(hglob.0));
         if result.is_err() {
-            let _ = GlobalFree(hglob);
             let _ = CloseClipboard();
             return Err("Failed to set clipboard data".into());
         }
