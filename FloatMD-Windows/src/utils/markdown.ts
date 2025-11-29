@@ -199,8 +199,7 @@ function parseLine(line: string): MarkdownToken[] {
  * Parse inline markdown elements (bold, italic, code, links, wiki links, tags)
  */
 function parseInlineElements(text: string): MarkdownToken[] {
-  const tokens: MarkdownToken[] = [];
-  let remaining = text;
+  const result: MarkdownToken[] = [];
   let position = 0;
 
   // Pattern to match all inline elements
@@ -212,29 +211,29 @@ function parseInlineElements(text: string): MarkdownToken[] {
     if (match.index > position) {
       const textBefore = text.substring(position, match.index);
       if (textBefore) {
-        tokens.push({ type: 'text', content: textBefore });
+        result.push({ type: 'text', content: textBefore });
       }
     }
 
     // Add the matched token
     if (match[2]) {
       // Bold **text**
-      tokens.push({ type: 'bold', content: match[0] });
+      result.push({ type: 'bold', content: match[0] });
     } else if (match[3]) {
       // Italic *text*
-      tokens.push({ type: 'italic', content: match[0] });
+      result.push({ type: 'italic', content: match[0] });
     } else if (match[4]) {
       // Inline code `text`
-      tokens.push({ type: 'code', content: match[0] });
+      result.push({ type: 'code', content: match[0] });
     } else if (match[5] && match[6]) {
       // Link [text](url)
-      tokens.push({ type: 'link', content: match[0], url: match[6] });
+      result.push({ type: 'link', content: match[0], url: match[6] });
     } else if (match[7]) {
       // Wiki link [[Title]]
-      tokens.push({ type: 'wikiLink', content: match[0] });
+      result.push({ type: 'wikiLink', content: match[0] });
     } else if (match[8]) {
       // Tag #tagname
-      tokens.push({ type: 'tag', content: match[0] });
+      result.push({ type: 'tag', content: match[0] });
     }
 
     position = match.index + match[0].length;
@@ -244,14 +243,14 @@ function parseInlineElements(text: string): MarkdownToken[] {
   if (position < text.length) {
     const textAfter = text.substring(position);
     if (textAfter) {
-      tokens.push({ type: 'text', content: textAfter });
+      result.push({ type: 'text', content: textAfter });
     }
   }
 
   // If no matches, return the whole text as a single token
-  if (tokens.length === 0) {
+  if (result.length === 0) {
     return [{ type: 'text', content: text }];
   }
 
-  return tokens;
+  return result;
 }
