@@ -852,6 +852,7 @@ class ClickableTextView: NSTextView {
     var onWikiLinkClick: ((String) -> Void)?
     var onTagClick: ((String) -> Void)?
     var onWorkspaceClick: ((String, String) -> Void)?  // (path, editor)
+    var onWorkspaceNavigate: ((String) -> Void)?  // Navigate to workspace in browser
     var onEnterPressed: (() -> Bool)?
     var onTabPressed: ((Bool) -> Bool)?  // Bool = isShiftTab
     var onArrowKey: ((Bool) -> Bool)?  // Bool = isDown
@@ -913,10 +914,15 @@ class ClickableTextView: NSTextView {
                 onTagClick?(tagName)
                 return
             }
-            // Check for workspace tag
+            // Check for workspace tag (editor links like @vscode[path])
             if let workspacePath = storage.attribute(.init("workspacePath"), at: charIndex, effectiveRange: nil) as? String,
                let workspaceEditor = storage.attribute(.init("workspaceEditor"), at: charIndex, effectiveRange: nil) as? String {
                 onWorkspaceClick?(workspacePath, workspaceEditor)
+                return
+            }
+            // Check for workspace navigation pill (@workspace)
+            if let workspaceTarget = storage.attribute(.init("workspaceClickTarget"), at: charIndex, effectiveRange: nil) as? String {
+                onWorkspaceNavigate?(workspaceTarget)
                 return
             }
         }
@@ -940,6 +946,10 @@ class ClickableTextView: NSTextView {
                 return
             }
             if storage.attribute(.init("workspacePath"), at: charIndex, effectiveRange: nil) != nil {
+                NSCursor.pointingHand.set()
+                return
+            }
+            if storage.attribute(.init("workspaceClickTarget"), at: charIndex, effectiveRange: nil) != nil {
                 NSCursor.pointingHand.set()
                 return
             }
@@ -1143,6 +1153,7 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         textView.onWikiLinkClick = { [weak self] target in self?.navigateToNote(titled: target) }
         textView.onTagClick = { [weak self] tagName in self?.showTagSearch(for: tagName) }
         textView.onWorkspaceClick = { [weak self] path, editor in self?.openWorkspace(path: path, editor: editor) }
+        textView.onWorkspaceNavigate = { [weak self] workspace in self?.navigateToWorkspace(workspace) }
         textView.onEnterPressed = { [weak self] in self?.handleEnterKey() ?? false }
         textView.onTabPressed = { [weak self] isShift in self?.handleTabKey(isShift: isShift) ?? false }
         textView.onArrowKey = { [weak self] isDown in self?.handleArrowKey(isDown: isDown) ?? false }
@@ -1242,6 +1253,20 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
             }
             addSubview(browser)
             noteBrowserView = browser
+        }
+    }
+
+    private func navigateToWorkspace(_ workspace: String) {
+        // Set the active workspace and show the browser
+        NotesManager.shared.setActiveWorkspace(workspace)
+        updateWorkspaceIndicator()
+
+        // If browser is not open, open it
+        if noteBrowserView == nil {
+            toggleBrowseNotes()
+        } else {
+            // Refresh the browser to show the new workspace
+            noteBrowserView?.reloadNotes()
         }
     }
 
@@ -1791,6 +1816,7 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         textStorage.removeAttribute(.init("workspacePath"), range: fullRange)
         textStorage.removeAttribute(.init("workspaceEditor"), range: fullRange)
         textStorage.removeAttribute(.init("workspacePillBackground"), range: fullRange)
+        textStorage.removeAttribute(.init("workspaceClickTarget"), range: fullRange)
         textStorage.removeAttribute(.backgroundColor, range: fullRange)
         textStorage.removeAttribute(.strikethroughStyle, range: fullRange)
         textStorage.removeAttribute(.underlineStyle, range: fullRange)
@@ -2018,6 +2044,18 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
             }
             textStorage.addAttribute(.foregroundColor, value: self.tagColor, range: range)
             textStorage.addAttribute(.init("tagPillBackground"), value: self.tagBackground, range: range)
+        }
+
+        // Workspace names @workspace or @workspace/subworkspace - clickable pills that navigate to workspace browser
+        // Matches @. (global) or @word or @word/subword/etc
+        applyPattern("(?<=\\s)@(\\.|[a-zA-Z][a-zA-Z0-9_-]*(?:/[a-zA-Z0-9_-]+)*)", to: textStorage, in: text) { range, match in
+            // Extract the workspace name (without @)
+            if match.numberOfRanges > 1, let workspaceRange = Range(match.range(at: 1), in: text) {
+                let workspaceName = String(text[workspaceRange])
+                textStorage.addAttribute(.init("workspaceClickTarget"), value: workspaceName, range: range)
+            }
+            textStorage.addAttribute(.foregroundColor, value: self.workspaceTagColor, range: range)
+            textStorage.addAttribute(.init("workspacePillBackground"), value: self.workspaceTagBackground, range: range)
         }
 
         // Workspace tags @vscode[path], @cursor[path], @anti[path], @workspace[path]
@@ -3046,6 +3084,15 @@ class TagSearchView: NSView {
     }
 }
 
+// MARK: - Pill Close Button
+class PillCloseButton: NSButton {
+    var onClose: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        onClose?()
+    }
+}
+
 // MARK: - Metadata Bar View
 class MetadataBarView: NSView {
     private var tagPillsContainer: NSView!
@@ -3147,8 +3194,6 @@ class MetadataBarView: NSView {
     }
 
     private func createPill(text: String, textColor: NSColor, backgroundColor: NSColor, onRemove: @escaping () -> Void) -> NSView {
-        let theme = ThemeManager.shared.currentTheme
-
         // Create pill container
         let pill = NSView()
         pill.wantsLayer = true
@@ -3162,27 +3207,14 @@ class MetadataBarView: NSView {
         label.frame = NSRect(x: 8, y: 2, width: 0, height: 18)
         label.sizeToFit()
 
-        // Create close button
-        let closeButton = NSButton(frame: NSRect(x: label.frame.width + 10, y: 2, width: 16, height: 16))
+        // Create close button using a clickable NSButton subclass
+        let closeButton = PillCloseButton(frame: NSRect(x: label.frame.width + 10, y: 2, width: 16, height: 16))
         closeButton.bezelStyle = .inline
         closeButton.isBordered = false
         closeButton.image = tintedSymbol("xmark", color: textColor.withAlphaComponent(0.7))
-        closeButton.target = nil
-        closeButton.action = nil
+        closeButton.onClose = onRemove
 
-        // Create clickable overlay for remove action
-        let clickOverlay = NSView(frame: NSRect(x: label.frame.width + 10, y: 2, width: 16, height: 16))
-
-        // Use a tracking area for hover
-        let trackingArea = NSTrackingArea(
-            rect: clickOverlay.bounds,
-            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
-            owner: pill,
-            userInfo: ["action": onRemove as Any]
-        )
-        clickOverlay.addTrackingArea(trackingArea)
-
-        // Store the remove action for mouse down
+        // Store the remove action for mouse down fallback
         objc_setAssociatedObject(pill, "removeAction", onRemove as Any, .OBJC_ASSOCIATION_RETAIN)
 
         // Size the pill
@@ -3190,11 +3222,9 @@ class MetadataBarView: NSView {
         pill.frame = NSRect(x: 0, y: 0, width: totalWidth, height: 20)
         label.frame.origin.y = 1
         closeButton.frame.origin.y = 2
-        clickOverlay.frame.origin.y = 2
 
         pill.addSubview(label)
         pill.addSubview(closeButton)
-        pill.addSubview(clickOverlay)
 
         return pill
     }
@@ -3204,8 +3234,11 @@ class MetadataBarView: NSView {
 
         // Check if click is on any pill's close button area
         for pillContainer in [tagPillsContainer, workspacePillsContainer] {
-            for pill in pillContainer!.subviews {
-                let pillLocation = pill.convert(location, from: self)
+            guard let container = pillContainer else { continue }
+            let containerLocation = container.convert(location, from: self)
+
+            for pill in container.subviews {
+                let pillLocation = pill.convert(containerLocation, from: container)
                 if pill.bounds.contains(pillLocation) {
                     // Check if it's in the close button area (right side of pill)
                     if pillLocation.x > pill.bounds.width - 24 {
