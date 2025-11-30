@@ -4482,7 +4482,7 @@ class InjectionSettings {
     var toggleKeyCode: UInt32 {
         get {
             let stored = UserDefaults.standard.integer(forKey: toggleKeyCodeKey)
-            return stored == 0 ? 46 : UInt32(stored) // Default: 46 = 'm'
+            return stored == 0 ? 44 : UInt32(stored) // Default: 44 = '/'
         }
         set { UserDefaults.standard.set(Int(newValue), forKey: toggleKeyCodeKey) }
     }
@@ -4490,13 +4490,13 @@ class InjectionSettings {
     var toggleModifiers: UInt32 {
         get {
             let stored = UserDefaults.standard.integer(forKey: toggleModifiersKey)
-            return stored == 0 ? UInt32(cmdKey | shiftKey) : UInt32(stored) // Default: Cmd+Shift
+            return stored == 0 ? UInt32(cmdKey | optionKey | controlKey) : UInt32(stored) // Default: Ctrl+Cmd+Opt
         }
         set { UserDefaults.standard.set(Int(newValue), forKey: toggleModifiersKey) }
     }
 
     var toggleDisplay: String {
-        get { UserDefaults.standard.string(forKey: toggleDisplayKey) ?? "Cmd+Shift+M" }
+        get { UserDefaults.standard.string(forKey: toggleDisplayKey) ?? "Ctrl+Cmd+Opt+/" }
         set { UserDefaults.standard.set(newValue, forKey: toggleDisplayKey) }
     }
 
@@ -4817,7 +4817,7 @@ class HotkeyManager {
     }
 
     func handleToggleHotkey() {
-        NSLog("FloatNote: Hotkey Cmd+Shift+M pressed!")
+        NSLog("FloatNote: Toggle hotkey pressed!")
         guard let appDelegate = NSApp.delegate as? AppDelegate else {
             NSLog("FloatNote: ERROR - Could not get AppDelegate")
             return
