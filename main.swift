@@ -508,6 +508,8 @@ struct Theme {
     let wikiLinkMissing: NSColor
     let tag: NSColor
     let tagBackground: NSColor
+    let workspaceTag: NSColor
+    let workspaceTagBackground: NSColor
     let cursor: NSColor
     let visualEffectMaterial: NSVisualEffectView.Material
 
@@ -528,6 +530,8 @@ struct Theme {
         wikiLinkMissing: NSColor(calibratedRed: 0.7, green: 0.5, blue: 0.3, alpha: 1.0),
         tag: NSColor(calibratedRed: 0.4, green: 0.75, blue: 0.6, alpha: 1.0),
         tagBackground: NSColor(calibratedRed: 0.4, green: 0.75, blue: 0.6, alpha: 0.15),
+        workspaceTag: NSColor(calibratedRed: 0.6, green: 0.5, blue: 0.9, alpha: 1.0),
+        workspaceTagBackground: NSColor(calibratedRed: 0.6, green: 0.5, blue: 0.9, alpha: 0.15),
         cursor: .white,
         visualEffectMaterial: .hudWindow
     )
@@ -549,6 +553,8 @@ struct Theme {
         wikiLinkMissing: NSColor(calibratedRed: 0.55, green: 0.35, blue: 0.15, alpha: 1.0),
         tag: NSColor(calibratedRed: 0.15, green: 0.5, blue: 0.35, alpha: 1.0),
         tagBackground: NSColor(calibratedRed: 0.15, green: 0.5, blue: 0.35, alpha: 0.15),
+        workspaceTag: NSColor(calibratedRed: 0.4, green: 0.3, blue: 0.7, alpha: 1.0),
+        workspaceTagBackground: NSColor(calibratedRed: 0.4, green: 0.3, blue: 0.7, alpha: 0.12),
         cursor: NSColor(white: 0.15, alpha: 1.0),
         visualEffectMaterial: .sheet
     )
@@ -570,6 +576,8 @@ struct Theme {
         wikiLinkMissing: NSColor(calibratedRed: 0.75, green: 0.62, blue: 0.53, alpha: 1.0),  // Nord aurora orange
         tag: NSColor(calibratedRed: 0.70, green: 0.56, blue: 0.68, alpha: 1.0),  // Nord aurora purple
         tagBackground: NSColor(calibratedRed: 0.70, green: 0.56, blue: 0.68, alpha: 0.18),
+        workspaceTag: NSColor(calibratedRed: 0.51, green: 0.63, blue: 0.76, alpha: 1.0),  // Nord frost #81A1C1
+        workspaceTagBackground: NSColor(calibratedRed: 0.51, green: 0.63, blue: 0.76, alpha: 0.18),
         cursor: NSColor(calibratedRed: 0.85, green: 0.87, blue: 0.91, alpha: 1.0),
         visualEffectMaterial: .hudWindow
     )
@@ -591,6 +599,8 @@ struct Theme {
         wikiLinkMissing: NSColor(calibratedRed: 0.80, green: 0.29, blue: 0.09, alpha: 1.0),  // Solarized orange #cb4b16
         tag: NSColor(calibratedRed: 0.83, green: 0.21, blue: 0.51, alpha: 1.0),  // Solarized magenta #d33682
         tagBackground: NSColor(calibratedRed: 0.83, green: 0.21, blue: 0.51, alpha: 0.18),
+        workspaceTag: NSColor(calibratedRed: 0.42, green: 0.44, blue: 0.77, alpha: 1.0),  // Solarized violet #6c71c4
+        workspaceTagBackground: NSColor(calibratedRed: 0.42, green: 0.44, blue: 0.77, alpha: 0.18),
         cursor: NSColor(calibratedRed: 0.58, green: 0.63, blue: 0.63, alpha: 1.0),
         visualEffectMaterial: .hudWindow
     )
@@ -612,6 +622,8 @@ struct Theme {
         wikiLinkMissing: NSColor(calibratedRed: 0.65, green: 0.40, blue: 0.25, alpha: 1.0),
         tag: NSColor(calibratedRed: 0.50, green: 0.40, blue: 0.30, alpha: 1.0),
         tagBackground: NSColor(calibratedRed: 0.50, green: 0.40, blue: 0.30, alpha: 0.12),
+        workspaceTag: NSColor(calibratedRed: 0.45, green: 0.35, blue: 0.55, alpha: 1.0),
+        workspaceTagBackground: NSColor(calibratedRed: 0.45, green: 0.35, blue: 0.55, alpha: 0.12),
         cursor: NSColor(calibratedRed: 0.35, green: 0.28, blue: 0.20, alpha: 1.0),
         visualEffectMaterial: .sheet
     )
@@ -658,31 +670,25 @@ class DraggableHeaderView: NSView {
 }
 
 // MARK: - Draggable Title Button
-// A button that allows window dragging on click-drag, but triggers action on simple click
+// A button that allows window dragging only - does not trigger any actions
 class DraggableTitleButton: NSButton {
-    private var mouseDownLocation: NSPoint?
-    private var didDrag = false
-
     override var mouseDownCanMoveWindow: Bool { true }
 
     override func mouseDown(with event: NSEvent) {
-        mouseDownLocation = event.locationInWindow
-        didDrag = false
+        // Record window position before drag
+        let windowOriginBefore = window?.frame.origin ?? .zero
 
-        // Let the window handle dragging
+        // performDrag runs its own event loop and returns when drag ends
         window?.performDrag(with: event)
-    }
 
-    override func mouseUp(with event: NSEvent) {
-        guard let downLocation = mouseDownLocation else { return }
-        let upLocation = event.locationInWindow
-        let distance = hypot(upLocation.x - downLocation.x, upLocation.y - downLocation.y)
+        // Check if window moved
+        let windowOriginAfter = window?.frame.origin ?? .zero
+        let distance = hypot(windowOriginAfter.x - windowOriginBefore.x, windowOriginAfter.y - windowOriginBefore.y)
 
-        // If mouse didn't move much, treat as click
-        if distance < 5 {
-            _ = target?.perform(action, with: self)
+        // If window didn't move, it was a click - trigger action (open browser)
+        if distance < 3 {
+            target?.perform(action, with: self)
         }
-        mouseDownLocation = nil
     }
 }
 
@@ -715,6 +721,8 @@ class PillBackgroundLayoutManager: NSLayoutManager {
 class ClickableTextView: NSTextView {
     var onCheckboxClick: ((NSRange) -> Void)?
     var onWikiLinkClick: ((String) -> Void)?
+    var onTagClick: ((String) -> Void)?
+    var onWorkspaceClick: ((String, String) -> Void)?  // (path, editor)
     var onEnterPressed: (() -> Bool)?
     var onTabPressed: ((Bool) -> Bool)?  // Bool = isShiftTab
     var onArrowKey: ((Bool) -> Bool)?  // Bool = isDown
@@ -771,6 +779,17 @@ class ClickableTextView: NSTextView {
                 onWikiLinkClick?(linkTarget)
                 return
             }
+            // Check for tag
+            if let tagName = storage.attribute(.init("tagName"), at: charIndex, effectiveRange: nil) as? String {
+                onTagClick?(tagName)
+                return
+            }
+            // Check for workspace tag
+            if let workspacePath = storage.attribute(.init("workspacePath"), at: charIndex, effectiveRange: nil) as? String,
+               let workspaceEditor = storage.attribute(.init("workspaceEditor"), at: charIndex, effectiveRange: nil) as? String {
+                onWorkspaceClick?(workspacePath, workspaceEditor)
+                return
+            }
         }
         super.mouseDown(with: event)
     }
@@ -784,6 +803,14 @@ class ClickableTextView: NSTextView {
                 return
             }
             if storage.attribute(.init("wikiLinkTarget"), at: charIndex, effectiveRange: nil) != nil {
+                NSCursor.pointingHand.set()
+                return
+            }
+            if storage.attribute(.init("tagName"), at: charIndex, effectiveRange: nil) != nil {
+                NSCursor.pointingHand.set()
+                return
+            }
+            if storage.attribute(.init("workspacePath"), at: charIndex, effectiveRange: nil) != nil {
                 NSCursor.pointingHand.set()
                 return
             }
@@ -815,6 +842,7 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
     private var titleButton: NSButton!
     private var noteBrowserView: NoteBrowserView?
     private var settingsView: SettingsView?
+    private var tagSearchView: TagSearchView?
     private var visualEffectView: NSVisualEffectView!
     private var backgroundView: NSView!
     private var isUpdatingFormatting = false
@@ -850,6 +878,8 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
     private var wikiLinkMissingColor: NSColor { theme.wikiLinkMissing }
     private var tagColor: NSColor { theme.tag }
     private var tagBackground: NSColor { theme.tagBackground }
+    private var workspaceTagColor: NSColor { theme.workspaceTag }
+    private var workspaceTagBackground: NSColor { theme.workspaceTagBackground }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -932,17 +962,20 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: bounds.width, height: bounds.height - 36))
         scrollView.drawsBackground = false
         scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
         scrollView.autoresizingMask = [.width, .height]
 
         // Create text system with custom layout manager for pill backgrounds
         let textStorage = NSTextStorage()
         let layoutManager = PillBackgroundLayoutManager()
         textStorage.addLayoutManager(layoutManager)
-        let textContainer = NSTextContainer(containerSize: NSSize(width: scrollView.bounds.width, height: CGFloat.greatestFiniteMagnitude))
-        textContainer.widthTracksTextView = true
+        let textContainer = NSTextContainer(containerSize: NSSize(width: scrollView.contentSize.width, height: CGFloat.greatestFiniteMagnitude))
+        textContainer.widthTracksTextView = false
+        textContainer.lineFragmentPadding = 0
         layoutManager.addTextContainer(textContainer)
 
-        textView = ClickableTextView(frame: scrollView.bounds, textContainer: textContainer)
+        textView = ClickableTextView(frame: NSRect(x: 0, y: 0, width: scrollView.contentSize.width, height: scrollView.contentSize.height), textContainer: textContainer)
         textView.delegate = self
         textView.drawsBackground = false
         textView.isRichText = true
@@ -951,9 +984,16 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         textView.insertionPointColor = theme.cursor
         textView.typingAttributes = [.font: baseFont, .foregroundColor: textColor]
         textView.textStorage?.delegate = self
+        textView.autoresizingMask = [.width]
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.minSize = NSSize(width: 0, height: scrollView.contentSize.height)
 
         textView.onCheckboxClick = { [weak self] range in self?.toggleCheckbox(at: range) }
         textView.onWikiLinkClick = { [weak self] target in self?.navigateToNote(titled: target) }
+        textView.onTagClick = { [weak self] tagName in self?.showTagSearch(for: tagName) }
+        textView.onWorkspaceClick = { [weak self] path, editor in self?.openWorkspace(path: path, editor: editor) }
         textView.onEnterPressed = { [weak self] in self?.handleEnterKey() ?? false }
         textView.onTabPressed = { [weak self] isShift in self?.handleTabKey(isShift: isShift) ?? false }
         textView.onArrowKey = { [weak self] isDown in self?.handleArrowKey(isDown: isDown) ?? false }
@@ -962,6 +1002,15 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
 
         scrollView.documentView = textView
         addSubview(scrollView)
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        // Update text container width to match the scroll view's content width
+        if let textContainer = textView?.textContainer {
+            let newWidth = scrollView.contentSize.width
+            textContainer.containerSize = NSSize(width: newWidth, height: CGFloat.greatestFiniteMagnitude)
+        }
     }
 
     @objc private func createNewNote() {
@@ -1472,6 +1521,10 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         textStorage.removeAttribute(.init("checkboxRange"), range: fullRange)
         textStorage.removeAttribute(.init("wikiLinkTarget"), range: fullRange)
         textStorage.removeAttribute(.init("tagPillBackground"), range: fullRange)
+        textStorage.removeAttribute(.init("tagName"), range: fullRange)
+        textStorage.removeAttribute(.init("workspacePath"), range: fullRange)
+        textStorage.removeAttribute(.init("workspaceEditor"), range: fullRange)
+        textStorage.removeAttribute(.init("workspacePillBackground"), range: fullRange)
         textStorage.removeAttribute(.backgroundColor, range: fullRange)
         textStorage.removeAttribute(.strikethroughStyle, range: fullRange)
         textStorage.removeAttribute(.underlineStyle, range: fullRange)
@@ -1691,9 +1744,91 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         // Tags #tagname - must start with letter, can contain letters, numbers, underscore, hyphen
         // Only match tags that are preceded by whitespace (not at start of line to avoid heading confusion)
         // Rendered as pills with rounded background
-        applyPattern("(?<=\\s)#([a-zA-Z][a-zA-Z0-9_-]*)", to: textStorage, in: text) { range, _ in
+        applyPattern("(?<=\\s)#([a-zA-Z][a-zA-Z0-9_-]*)", to: textStorage, in: text) { range, match in
+            // Extract the tag name (without #)
+            if match.numberOfRanges > 1, let tagNameRange = Range(match.range(at: 1), in: text) {
+                let tagName = String(text[tagNameRange])
+                textStorage.addAttribute(.init("tagName"), value: tagName, range: range)
+            }
             textStorage.addAttribute(.foregroundColor, value: self.tagColor, range: range)
             textStorage.addAttribute(.init("tagPillBackground"), value: self.tagBackground, range: range)
+        }
+
+        // Workspace tags @vscode[path], @cursor[path], @anti[path], @workspace[path]
+        // Opens the specified path in the corresponding editor
+        // Displayed as "(Editor: ProjectName)" pill when cursor is not on line
+        applyPattern("@(vscode|cursor|anti|workspace)\\[([^\\]]+)\\]", to: textStorage, in: text) { range, match in
+            let cursorOnLine = self.isCursorNear(range, cursorLineRange: cursorLineRange)
+
+            // Extract editor type and path
+            if match.numberOfRanges > 2,
+               let editorRange = Range(match.range(at: 1), in: text),
+               let pathRange = Range(match.range(at: 2), in: text) {
+                let editor = String(text[editorRange])
+                let path = String(text[pathRange])
+
+                // Store metadata for click handling on the full range
+                textStorage.addAttribute(.init("workspacePath"), value: path, range: range)
+                textStorage.addAttribute(.init("workspaceEditor"), value: editor, range: range)
+
+                if cursorOnLine {
+                    // Show full syntax when editing
+                    let syntaxStyle = self.syntaxColor
+                    let prefixLength = editor.count + 2  // @ + editor + [
+                    let suffixLength = 1  // ]
+
+                    textStorage.addAttribute(.foregroundColor, value: syntaxStyle, range: NSRange(location: range.location, length: prefixLength))
+                    textStorage.addAttribute(.foregroundColor, value: syntaxStyle, range: NSRange(location: range.location + range.length - suffixLength, length: suffixLength))
+
+                    let pathNSRange = NSRange(location: range.location + prefixLength, length: range.length - prefixLength - suffixLength)
+                    textStorage.addAttribute(.foregroundColor, value: self.workspaceTagColor, range: pathNSRange)
+                } else {
+                    // Display as condensed pill when not editing
+                    // Show editor name + project name, hide syntax and directory path
+                    // @cursor[/path/to/FloatMD.code-workspace] -> "cursor FloatMD.code-workspace"
+                    let projectName = (path as NSString).lastPathComponent
+
+                    // Calculate character positions
+                    let atSignRange = NSRange(location: range.location, length: 1)  // @
+                    let editorTextRange = NSRange(location: range.location + 1, length: editor.count)  // cursor
+                    let openBracketRange = NSRange(location: range.location + 1 + editor.count, length: 1)  // [
+                    let closeBracketRange = NSRange(location: range.location + range.length - 1, length: 1)  // ]
+
+                    // Path range (between [ and ])
+                    let pathStart = range.location + 1 + editor.count + 1
+                    let pathLength = range.length - editor.count - 3  // minus @ editor [ ]
+
+                    // Hide the @ symbol and show ( using the editor's first char position
+                    // Actually, we can't change the character, only style it
+                    // So let's just hide parts and show the project name nicely
+
+                    // Hide @ and [
+                    textStorage.addAttribute(.foregroundColor, value: self.hiddenColor, range: atSignRange)
+                    textStorage.addAttribute(.foregroundColor, value: self.hiddenColor, range: openBracketRange)
+                    textStorage.addAttribute(.foregroundColor, value: self.hiddenColor, range: closeBracketRange)
+
+                    // Style the editor name
+                    textStorage.addAttribute(.foregroundColor, value: self.workspaceTagColor.withAlphaComponent(0.7), range: editorTextRange)
+
+                    // Hide the directory path, show only project name
+                    let dirPathLength = path.count - projectName.count
+                    if dirPathLength > 0 && pathLength > projectName.count {
+                        // Hide directory portion
+                        let dirRange = NSRange(location: pathStart, length: dirPathLength)
+                        textStorage.addAttribute(.foregroundColor, value: self.hiddenColor, range: dirRange)
+
+                        // Style project name
+                        let nameRange = NSRange(location: pathStart + dirPathLength, length: projectName.count)
+                        textStorage.addAttribute(.foregroundColor, value: self.workspaceTagColor, range: nameRange)
+                        textStorage.addAttribute(.init("workspacePillBackground"), value: self.workspaceTagBackground, range: nameRange)
+                    } else {
+                        // Show full path styled
+                        let fullPathRange = NSRange(location: pathStart, length: pathLength)
+                        textStorage.addAttribute(.foregroundColor, value: self.workspaceTagColor, range: fullPathRange)
+                        textStorage.addAttribute(.init("workspacePillBackground"), value: self.workspaceTagBackground, range: fullPathRange)
+                    }
+                }
+            }
         }
     }
 
@@ -1769,7 +1904,108 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         window?.makeFirstResponder(textView)
     }
 
+    private func openWorkspace(path: String, editor: String) {
+        let resolvedPath = resolvePath(path)
+
+        // Determine which editor to use
+        let editorToUse = editor == "workspace" ? InjectionSettings.shared.defaultEditor : editor
+
+        // Build URL scheme based on editor
+        let urlString: String
+        switch editorToUse {
+        case "vscode":
+            urlString = "vscode://file\(resolvedPath)"
+        case "cursor":
+            urlString = "cursor://file\(resolvedPath)"
+        case "anti":
+            urlString = "antigravity://file\(resolvedPath)"
+        default:
+            urlString = "vscode://file\(resolvedPath)"
+        }
+
+        if let url = URL(string: urlString) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func resolvePath(_ path: String) -> String {
+        var resolved = path
+
+        // Expand ~ to home directory
+        if resolved.hasPrefix("~") {
+            resolved = NSString(string: resolved).expandingTildeInPath
+        }
+        // Handle relative paths (resolve relative to notes directory)
+        else if !resolved.hasPrefix("/") {
+            let notesDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? ""
+            resolved = (notesDir as NSString).appendingPathComponent(resolved)
+        }
+
+        return resolved
+    }
+
+    private func showTagSearch(for tagName: String) {
+        // Close other overlays
+        if let browser = noteBrowserView {
+            browser.removeFromSuperview()
+            noteBrowserView = nil
+        }
+        if let settings = settingsView {
+            settings.removeFromSuperview()
+            settingsView = nil
+        }
+        if let existing = tagSearchView {
+            existing.removeFromSuperview()
+            tagSearchView = nil
+        }
+
+        // Create tag search view
+        let searchView = TagSearchView(frame: NSRect(x: 0, y: 0, width: bounds.width, height: bounds.height - 36))
+        searchView.autoresizingMask = [.width, .height]
+        searchView.searchTag(tagName)
+        searchView.onSelectNote = { [weak self] note in
+            self?.tagSearchView?.removeFromSuperview()
+            self?.tagSearchView = nil
+            NotesManager.shared.setActiveNote(note)
+            self?.loadContent()
+            self?.window?.makeFirstResponder(self?.textView)
+        }
+        searchView.onClose = { [weak self] in
+            self?.tagSearchView?.removeFromSuperview()
+            self?.tagSearchView = nil
+        }
+        addSubview(searchView)
+        tagSearchView = searchView
+    }
+
     func getContent() -> String { textView.string }
+
+    func getSelectedTextOrContent() -> String {
+        let selectedRange = textView.selectedRange()
+        if selectedRange.length > 0 {
+            // There is a selection, return only the selected text
+            let nsText = textView.string as NSString
+            return nsText.substring(with: selectedRange)
+        } else {
+            // No selection, return full content
+            return textView.string
+        }
+    }
+
+    func deleteSelectedTextOrClearContent() {
+        let selectedRange = textView.selectedRange()
+        if selectedRange.length > 0 {
+            // Delete only the selected text
+            if let textStorage = textView.textStorage {
+                textStorage.replaceCharacters(in: selectedRange, with: "")
+            }
+        } else {
+            // Clear the entire note
+            textView.string = ""
+        }
+        // Save the changes
+        NotesManager.shared.updateActiveNote(content: textView.string)
+    }
 
     func loadActiveNote() {
         loadContent()
@@ -2113,6 +2349,256 @@ class HotkeyRecorderView: NSTextField {
     }
 }
 
+// MARK: - Tag Search View
+class TagSearchView: NSView {
+    var onSelectNote: ((Note) -> Void)?
+    var onClose: (() -> Void)?
+
+    private var titleLabel: NSTextField!
+    private var closeButton: NSButton!
+    private var scrollView: NSScrollView!
+    private var resultsStackView: NSStackView!
+    private var currentTag: String = ""
+
+    struct TagResult {
+        let note: Note
+        let contextLines: [String]  // Lines containing the tag with context
+    }
+
+    private var results: [TagResult] = []
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        setupUI()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    private func setupUI() {
+        let theme = ThemeManager.shared.currentTheme
+
+        wantsLayer = true
+        layer?.backgroundColor = theme.background.cgColor
+
+        // Header with title and close button
+        let headerHeight: CGFloat = 40
+
+        titleLabel = NSTextField(labelWithString: "#tag")
+        titleLabel.font = .systemFont(ofSize: 16, weight: .semibold)
+        titleLabel.textColor = theme.text
+        titleLabel.frame = NSRect(x: 15, y: bounds.height - headerHeight + 10, width: bounds.width - 60, height: 24)
+        titleLabel.autoresizingMask = [.width, .minYMargin]
+        addSubview(titleLabel)
+
+        closeButton = NSButton(frame: NSRect(x: bounds.width - 35, y: bounds.height - headerHeight + 8, width: 28, height: 28))
+        closeButton.bezelStyle = .inline
+        closeButton.isBordered = false
+        closeButton.image = tintedSymbol("xmark", color: theme.icon)
+        closeButton.target = self
+        closeButton.action = #selector(closeView)
+        closeButton.autoresizingMask = [.minXMargin, .minYMargin]
+        addSubview(closeButton)
+
+        // Scroll view for results
+        scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: bounds.width, height: bounds.height - headerHeight))
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autoresizingMask = [.width, .height]
+        scrollView.contentView.drawsBackground = false
+
+        // Stack view to hold result cards
+        resultsStackView = NSStackView(frame: NSRect(x: 0, y: 0, width: bounds.width, height: 400))
+        resultsStackView.orientation = .vertical
+        resultsStackView.alignment = .centerX
+        resultsStackView.spacing = 10
+        resultsStackView.edgeInsets = NSEdgeInsets(top: 10, left: 15, bottom: 10, right: 15)
+
+        scrollView.documentView = resultsStackView
+        addSubview(scrollView)
+
+        NotificationCenter.default.addObserver(self, selector: #selector(themeDidChange), name: .themeDidChange, object: nil)
+    }
+
+    @objc private func themeDidChange() {
+        let theme = ThemeManager.shared.currentTheme
+        layer?.backgroundColor = theme.background.cgColor
+        titleLabel.textColor = theme.text
+        closeButton.image = tintedSymbol("xmark", color: theme.icon)
+        refreshResults()
+    }
+
+    @objc private func closeView() {
+        onClose?()
+    }
+
+    func searchTag(_ tagName: String) {
+        currentTag = tagName
+        titleLabel.stringValue = "#\(tagName)"
+
+        // Find all notes containing this tag
+        results = []
+
+        // Use regex: #tagname followed by non-word-char or end of string
+        let pattern = "#\(NSRegularExpression.escapedPattern(for: tagName))(?![a-zA-Z0-9_-])"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else {
+            refreshResults()
+            return
+        }
+
+        for note in NotesManager.shared.notes {
+            let content = note.content
+            let lines = content.components(separatedBy: "\n")
+            var contextLines: [String] = []
+
+            for (lineIndex, line) in lines.enumerated() {
+                let lineRange = NSRange(location: 0, length: line.utf16.count)
+                if regex.firstMatch(in: line, options: [], range: lineRange) != nil {
+                    // Build context: line before, current line, line after
+                    var context = ""
+                    if lineIndex > 0 {
+                        context += "..." + String(lines[lineIndex - 1].prefix(60)) + "\n"
+                    }
+                    context += line
+                    if lineIndex < lines.count - 1 {
+                        context += "\n" + String(lines[lineIndex + 1].prefix(60)) + "..."
+                    }
+                    if !contextLines.contains(context) {
+                        contextLines.append(context)
+                    }
+                }
+            }
+
+            if !contextLines.isEmpty {
+                results.append(TagResult(note: note, contextLines: contextLines))
+            }
+        }
+
+        refreshResults()
+    }
+    private func refreshResults() {
+        NSLog("FloatNote: refreshResults called with \(results.count) results")
+
+        // Clear existing results
+        resultsStackView.arrangedSubviews.forEach { $0.removeFromSuperview() }
+
+        let theme = ThemeManager.shared.currentTheme
+        let contentWidth = bounds.width - 30
+
+        if results.isEmpty {
+            let noResultsLabel = NSTextField(labelWithString: "No notes found with #\(currentTag)")
+            noResultsLabel.textColor = theme.secondaryText
+            noResultsLabel.font = .systemFont(ofSize: 13)
+            resultsStackView.addArrangedSubview(noResultsLabel)
+        } else {
+            for result in results {
+                let card = createResultCard(for: result, theme: theme, width: contentWidth)
+                resultsStackView.addArrangedSubview(card)
+            }
+        }
+
+        // Update stack view frame to fit content
+        let fittingHeight = max(resultsStackView.fittingSize.height, 100)
+        resultsStackView.frame = NSRect(x: 0, y: 0, width: bounds.width, height: fittingHeight)
+
+        // Make sure scroll view's document view is properly set
+        scrollView.documentView = resultsStackView
+    }
+
+    private func createResultCard(for result: TagResult, theme: Theme, width: CGFloat) -> NSView {
+        // Calculate height based on content
+        let cardHeight: CGFloat = 90
+
+        let card = NSView(frame: NSRect(x: 0, y: 0, width: width, height: cardHeight))
+        card.wantsLayer = true
+        card.layer?.backgroundColor = theme.codeBackground.cgColor
+        card.layer?.cornerRadius = 8
+
+        // Title at top
+        let titleLabel = NSTextField(labelWithString: result.note.title.isEmpty ? "Untitled" : result.note.title)
+        titleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        titleLabel.textColor = theme.text
+        titleLabel.isBezeled = false
+        titleLabel.isEditable = false
+        titleLabel.drawsBackground = false
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.frame = NSRect(x: 12, y: cardHeight - 30, width: width - 24, height: 20)
+        card.addSubview(titleLabel)
+
+        // Context snippet below title
+        let contextText = result.contextLines.first ?? ""
+        let snippetLabel = NSTextField(labelWithString: contextText)
+        snippetLabel.font = .systemFont(ofSize: 11)
+        snippetLabel.textColor = theme.secondaryText
+        snippetLabel.isBezeled = false
+        snippetLabel.isEditable = false
+        snippetLabel.drawsBackground = false
+        snippetLabel.maximumNumberOfLines = 3
+        snippetLabel.lineBreakMode = .byWordWrapping
+        snippetLabel.cell?.wraps = true
+        snippetLabel.frame = NSRect(x: 12, y: 8, width: width - 24, height: cardHeight - 40)
+        card.addSubview(snippetLabel)
+
+        // Make clickable
+        let clickArea = ClickableView(frame: card.bounds)
+        clickArea.autoresizingMask = [.width, .height]
+        clickArea.onClick = { [weak self] in
+            self?.onSelectNote?(result.note)
+        }
+        clickArea.onHover = { hovering in
+            card.layer?.backgroundColor = hovering ?
+                theme.codeBackground.blending(with: 0.1, of: theme.text)?.cgColor :
+                theme.codeBackground.cgColor
+        }
+        card.addSubview(clickArea)
+
+        // Set intrinsic content size for stack view
+        card.setContentHuggingPriority(.defaultHigh, for: .vertical)
+
+        return card
+    }
+}
+
+// Helper for clickable cards
+class ClickableView: NSView {
+    var onClick: (() -> Void)?
+    var onHover: ((Bool) -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        onHover?(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHover?(false)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach { removeTrackingArea($0) }
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil))
+    }
+}
+
+// Extension for color blending
+extension NSColor {
+    func blending(with amount: CGFloat, of color: NSColor) -> NSColor? {
+        guard let c1 = self.usingColorSpace(.deviceRGB),
+              let c2 = color.usingColorSpace(.deviceRGB) else { return nil }
+
+        let r = c1.redComponent * (1 - amount) + c2.redComponent * amount
+        let g = c1.greenComponent * (1 - amount) + c2.greenComponent * amount
+        let b = c1.blueComponent * (1 - amount) + c2.blueComponent * amount
+        let a = c1.alphaComponent * (1 - amount) + c2.alphaComponent * amount
+
+        return NSColor(red: r, green: g, blue: b, alpha: a)
+    }
+}
+
 class SettingsView: NSView {
     var onDismiss: (() -> Void)?
     private var themeButtons: [NSButton] = []
@@ -2125,9 +2611,14 @@ class SettingsView: NSView {
     private var injectionHotkeyRecorder: HotkeyRecorderView!
     private var toggleHotkeyLabel: NSTextField!
     private var toggleHotkeyRecorder: HotkeyRecorderView!
+    private var cutInjectHotkeyLabel: NSTextField!
+    private var cutInjectHotkeyRecorder: HotkeyRecorderView!
     private var ignoreTitlesCheckbox: NSButton!
     private var ignoreTagsCheckbox: NSButton!
     private var ignoreLinkFormattingCheckbox: NSButton!
+    private var workspaceLabel: NSTextField!
+    private var defaultEditorLabel: NSTextField!
+    private var defaultEditorPopup: NSPopUpButton!
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -2233,34 +2724,92 @@ class SettingsView: NSView {
         }
         addSubview(toggleHotkeyRecorder)
 
+        // Cut-inject hotkey
+        cutInjectHotkeyLabel = NSTextField(labelWithString: "Cut+Inject:")
+        cutInjectHotkeyLabel.font = .systemFont(ofSize: 12)
+        cutInjectHotkeyLabel.textColor = ThemeManager.shared.currentTheme.text.withAlphaComponent(0.6)
+        cutInjectHotkeyLabel.frame = NSRect(x: 20, y: bounds.height - 310, width: 70, height: 18)
+        cutInjectHotkeyLabel.autoresizingMask = [.minYMargin]
+        addSubview(cutInjectHotkeyLabel)
+
+        cutInjectHotkeyRecorder = HotkeyRecorderView(frame: NSRect(x: 95, y: bounds.height - 312, width: 180, height: 22))
+        cutInjectHotkeyRecorder.autoresizingMask = [.minYMargin]
+        cutInjectHotkeyRecorder.setHotkey(
+            keyCode: InjectionSettings.shared.cutInjectKeyCode,
+            modifiers: InjectionSettings.shared.cutInjectModifiers,
+            display: InjectionSettings.shared.cutInjectDisplay
+        )
+        cutInjectHotkeyRecorder.onHotkeyChanged = { keyCode, modifiers, display in
+            InjectionSettings.shared.cutInjectKeyCode = keyCode
+            InjectionSettings.shared.cutInjectModifiers = modifiers
+            InjectionSettings.shared.cutInjectDisplay = display
+            // Unregister and re-register hotkeys
+            HotkeyManager.shared.unregister()
+            HotkeyManager.shared.register()
+        }
+        addSubview(cutInjectHotkeyRecorder)
+
         // Injection Settings section
         injectionLabel = NSTextField(labelWithString: "Injection Settings")
         injectionLabel.font = .systemFont(ofSize: 14, weight: .medium)
         injectionLabel.textColor = ThemeManager.shared.currentTheme.text.withAlphaComponent(0.7)
-        injectionLabel.frame = NSRect(x: 20, y: bounds.height - 320, width: 200, height: 20)
+        injectionLabel.frame = NSRect(x: 20, y: bounds.height - 350, width: 200, height: 20)
         injectionLabel.autoresizingMask = [.minYMargin]
         addSubview(injectionLabel)
 
         // Ignore titles checkbox
         ignoreTitlesCheckbox = NSButton(checkboxWithTitle: "Ignore titles (# headings)", target: self, action: #selector(ignoreTitlesToggled))
-        ignoreTitlesCheckbox.frame = NSRect(x: 20, y: bounds.height - 345, width: 250, height: 20)
+        ignoreTitlesCheckbox.frame = NSRect(x: 20, y: bounds.height - 375, width: 250, height: 20)
         ignoreTitlesCheckbox.state = InjectionSettings.shared.ignoreTitles ? .on : .off
         ignoreTitlesCheckbox.autoresizingMask = [.minYMargin]
         addSubview(ignoreTitlesCheckbox)
 
         // Ignore tags checkbox
         ignoreTagsCheckbox = NSButton(checkboxWithTitle: "Ignore tags", target: self, action: #selector(ignoreTagsToggled))
-        ignoreTagsCheckbox.frame = NSRect(x: 20, y: bounds.height - 370, width: 250, height: 20)
+        ignoreTagsCheckbox.frame = NSRect(x: 20, y: bounds.height - 400, width: 250, height: 20)
         ignoreTagsCheckbox.state = InjectionSettings.shared.ignoreTags ? .on : .off
         ignoreTagsCheckbox.autoresizingMask = [.minYMargin]
         addSubview(ignoreTagsCheckbox)
 
         // Ignore link formatting checkbox
         ignoreLinkFormattingCheckbox = NSButton(checkboxWithTitle: "Ignore link formatting", target: self, action: #selector(ignoreLinkFormattingToggled))
-        ignoreLinkFormattingCheckbox.frame = NSRect(x: 20, y: bounds.height - 395, width: 250, height: 20)
+        ignoreLinkFormattingCheckbox.frame = NSRect(x: 20, y: bounds.height - 425, width: 250, height: 20)
         ignoreLinkFormattingCheckbox.state = InjectionSettings.shared.ignoreLinkFormatting ? .on : .off
         ignoreLinkFormattingCheckbox.autoresizingMask = [.minYMargin]
         addSubview(ignoreLinkFormattingCheckbox)
+
+        // Workspace Settings section
+        workspaceLabel = NSTextField(labelWithString: "Workspace Settings")
+        workspaceLabel.font = .systemFont(ofSize: 14, weight: .medium)
+        workspaceLabel.textColor = ThemeManager.shared.currentTheme.text.withAlphaComponent(0.7)
+        workspaceLabel.frame = NSRect(x: 20, y: bounds.height - 435, width: 200, height: 20)
+        workspaceLabel.autoresizingMask = [.minYMargin]
+        addSubview(workspaceLabel)
+
+        // Default editor label
+        defaultEditorLabel = NSTextField(labelWithString: "Default Editor:")
+        defaultEditorLabel.font = .systemFont(ofSize: 12)
+        defaultEditorLabel.textColor = ThemeManager.shared.currentTheme.text.withAlphaComponent(0.6)
+        defaultEditorLabel.frame = NSRect(x: 20, y: bounds.height - 465, width: 100, height: 18)
+        defaultEditorLabel.autoresizingMask = [.minYMargin]
+        addSubview(defaultEditorLabel)
+
+        // Default editor popup
+        defaultEditorPopup = NSPopUpButton(frame: NSRect(x: 125, y: bounds.height - 468, width: 150, height: 24), pullsDown: false)
+        defaultEditorPopup.addItems(withTitles: ["VS Code", "Cursor", "Antigravity"])
+        defaultEditorPopup.target = self
+        defaultEditorPopup.action = #selector(defaultEditorChanged)
+        defaultEditorPopup.autoresizingMask = [.minYMargin]
+
+        // Set current selection
+        let currentEditor = InjectionSettings.shared.defaultEditor
+        switch currentEditor {
+        case "vscode": defaultEditorPopup.selectItem(at: 0)
+        case "cursor": defaultEditorPopup.selectItem(at: 1)
+        case "anti": defaultEditorPopup.selectItem(at: 2)
+        default: defaultEditorPopup.selectItem(at: 0)
+        }
+        addSubview(defaultEditorPopup)
     }
 
     private func createThemeButton(theme: Theme, frame: NSRect) -> NSButton {
@@ -2325,6 +2874,13 @@ class SettingsView: NSView {
 
     @objc private func ignoreLinkFormattingToggled(_ sender: NSButton) {
         InjectionSettings.shared.ignoreLinkFormatting = (sender.state == .on)
+    }
+
+    @objc private func defaultEditorChanged(_ sender: NSPopUpButton) {
+        let editors = ["vscode", "cursor", "anti"]
+        if sender.indexOfSelectedItem >= 0 && sender.indexOfSelectedItem < editors.count {
+            InjectionSettings.shared.defaultEditor = editors[sender.indexOfSelectedItem]
+        }
     }
 
     private func updateSelectedTheme() {
@@ -2737,6 +3293,14 @@ class InjectionSettings {
     private let toggleModifiersKey = "FloatNote.Hotkey.Toggle.Modifiers"
     private let toggleDisplayKey = "FloatNote.Hotkey.Toggle.Display"
 
+    // Cut-inject hotkey settings
+    private let cutInjectKeyCodeKey = "FloatNote.Hotkey.CutInject.KeyCode"
+    private let cutInjectModifiersKey = "FloatNote.Hotkey.CutInject.Modifiers"
+    private let cutInjectDisplayKey = "FloatNote.Hotkey.CutInject.Display"
+
+    // Workspace tag settings
+    private let defaultEditorKey = "FloatNote.Workspace.DefaultEditor"
+
     var ignoreTitles: Bool {
         get { UserDefaults.standard.bool(forKey: ignoreTitlesKey) }
         set { UserDefaults.standard.set(newValue, forKey: ignoreTitlesKey) }
@@ -2799,6 +3363,34 @@ class InjectionSettings {
     var toggleDisplay: String {
         get { UserDefaults.standard.string(forKey: toggleDisplayKey) ?? "Cmd+Shift+M" }
         set { UserDefaults.standard.set(newValue, forKey: toggleDisplayKey) }
+    }
+
+    // Cut-inject hotkey configuration
+    var cutInjectKeyCode: UInt32 {
+        get {
+            let stored = UserDefaults.standard.integer(forKey: cutInjectKeyCodeKey)
+            return stored == 0 ? 7 : UInt32(stored) // Default: 7 = 'x'
+        }
+        set { UserDefaults.standard.set(Int(newValue), forKey: cutInjectKeyCodeKey) }
+    }
+
+    var cutInjectModifiers: UInt32 {
+        get {
+            let stored = UserDefaults.standard.integer(forKey: cutInjectModifiersKey)
+            return stored == 0 ? UInt32(cmdKey | optionKey) : UInt32(stored) // Default: Cmd+Opt
+        }
+        set { UserDefaults.standard.set(Int(newValue), forKey: cutInjectModifiersKey) }
+    }
+
+    var cutInjectDisplay: String {
+        get { UserDefaults.standard.string(forKey: cutInjectDisplayKey) ?? "Cmd+Opt+X" }
+        set { UserDefaults.standard.set(newValue, forKey: cutInjectDisplayKey) }
+    }
+
+    // Default editor for @workspace[path] tags
+    var defaultEditor: String {
+        get { UserDefaults.standard.string(forKey: defaultEditorKey) ?? "vscode" }
+        set { UserDefaults.standard.set(newValue, forKey: defaultEditorKey) }
     }
 
     func processContent(_ content: String) -> String {
@@ -2872,6 +3464,7 @@ class HotkeyManager {
     private var pasteHotkeyRef: EventHotKeyRef?
     private var toggleHotkeyRef: EventHotKeyRef?
     private var newNoteHotkeyRef: EventHotKeyRef?
+    private var cutPasteHotkeyRef: EventHotKeyRef?
 
     func unregister() {
         // Unregister existing hotkeys
@@ -2886,6 +3479,10 @@ class HotkeyManager {
         if let newNoteRef = newNoteHotkeyRef {
             UnregisterEventHotKey(newNoteRef)
             newNoteHotkeyRef = nil
+        }
+        if let cutPasteRef = cutPasteHotkeyRef {
+            UnregisterEventHotKey(cutPasteRef)
+            cutPasteHotkeyRef = nil
         }
         NSLog("FloatNote: Hotkeys unregistered")
     }
@@ -2972,6 +3569,26 @@ class HotkeyManager {
         } else {
             NSLog("FloatNote: ERROR - Failed to register new note hotkey: \(newNoteStatus)")
         }
+
+        // Register hotkey 4: Cut and Paste hotkey (configurable, default Cmd+Opt+X)
+        let cutPasteKeyCodeSetting = InjectionSettings.shared.cutInjectKeyCode
+        let cutPasteModifiersSetting = InjectionSettings.shared.cutInjectModifiers
+
+        let cutPasteHotKeyID = EventHotKeyID(signature: OSType(0x464D4420), id: 4) // "FMD " signature
+        let cutPasteStatus = RegisterEventHotKey(
+            cutPasteKeyCodeSetting,
+            cutPasteModifiersSetting,
+            cutPasteHotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &cutPasteHotkeyRef
+        )
+
+        if cutPasteStatus == noErr {
+            NSLog("FloatNote: Global hotkey \(InjectionSettings.shared.cutInjectDisplay) registered successfully (Carbon API)")
+        } else {
+            NSLog("FloatNote: ERROR - Failed to register cut and paste hotkey: \(cutPasteStatus)")
+        }
     }
 
     func handleHotkey(id: UInt32) {
@@ -2981,6 +3598,8 @@ class HotkeyManager {
             handleToggleHotkey()
         } else if id == 3 {
             handleNewNoteHotkey()
+        } else if id == 4 {
+            handleCutPasteHotkey()
         }
     }
 
@@ -2992,7 +3611,7 @@ class HotkeyManager {
             return
         }
 
-        let rawContent = view.getContent()
+        let rawContent = view.getSelectedTextOrContent()
         let content = InjectionSettings.shared.processContent(rawContent)
         NSLog("FloatNote: Content to paste: \(content.prefix(50))...")
 
@@ -3078,6 +3697,64 @@ class HotkeyManager {
             appDelegate.window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             NSLog("FloatNote: New note created and window activated")
+        }
+    }
+
+    func handleCutPasteHotkey() {
+        NSLog("FloatNote: Hotkey Cmd+Opt+X pressed!")
+        guard let appDelegate = NSApp.delegate as? AppDelegate,
+              let view = appDelegate.window.contentView as? MainView else {
+            NSLog("FloatNote: ERROR - Could not get MainView")
+            return
+        }
+
+        // Get the content to paste (selected or full)
+        let rawContent = view.getSelectedTextOrContent()
+        let content = InjectionSettings.shared.processContent(rawContent)
+        NSLog("FloatNote: Content to cut and paste: \(content.prefix(50))...")
+
+        // Visual feedback (yellow to indicate "cut" instead of just "paste")
+        DispatchQueue.main.async {
+            appDelegate.window.contentView?.layer?.backgroundColor = NSColor.yellow.cgColor
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.2
+                appDelegate.window.contentView?.animator().layer?.backgroundColor = NSColor.clear.cgColor
+            }
+        }
+
+        // Copy to clipboard
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(content, forType: .string)
+        NSLog("FloatNote: Content copied to clipboard")
+
+        // Use CGEvent to simulate Cmd+V - more reliable than AppleScript
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            NSLog("FloatNote: Simulating Cmd+V paste...")
+
+            // Create key down event for 'v' with command modifier
+            let source = CGEventSource(stateID: .hidSystemState)
+
+            // Key code 9 = 'v'
+            if let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true) {
+                keyDown.flags = .maskCommand
+                keyDown.post(tap: .cghidEventTap)
+            }
+
+            // Key up event
+            if let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false) {
+                keyUp.flags = .maskCommand
+                keyUp.post(tap: .cghidEventTap)
+            }
+
+            NSLog("FloatNote: Paste event posted")
+
+            // After pasting, delete the content from the note
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                NSLog("FloatNote: Deleting content from note")
+                view.deleteSelectedTextOrClearContent()
+                NSLog("FloatNote: Content deleted from note and saved")
+            }
         }
     }
 }
