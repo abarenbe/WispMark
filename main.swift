@@ -8,6 +8,8 @@ struct Note: Codable, Identifiable {
     var createdAt: Date
     var modifiedAt: Date
     var isPinned: Bool
+    var workspaces: Set<String>
+    var tags: Set<String>
 
     var title: String {
         // Find first non-empty line
@@ -32,6 +34,27 @@ struct Note: Codable, Identifiable {
         self.createdAt = Date()
         self.modifiedAt = Date()
         self.isPinned = isPinned
+        self.workspaces = []
+        self.tags = []
+    }
+
+    // CodingKeys for backward compatibility
+    enum CodingKeys: String, CodingKey {
+        case id, content, createdAt, modifiedAt, isPinned, workspaces, tags
+    }
+
+    // Custom decoder for backward compatibility with existing notes
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        content = try container.decode(String.self, forKey: .content)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        modifiedAt = try container.decode(Date.self, forKey: .modifiedAt)
+        isPinned = try container.decode(Bool.self, forKey: .isPinned)
+
+        // Default to empty sets if fields don't exist (backward compatibility)
+        workspaces = try container.decodeIfPresent(Set<String>.self, forKey: .workspaces) ?? []
+        tags = try container.decodeIfPresent(Set<String>.self, forKey: .tags) ?? []
     }
 }
 
@@ -40,9 +63,19 @@ class NotesManager {
     static let shared = NotesManager()
     private let storageKey = "floatmd_notes"
     private let activeNoteKey = "floatmd_active_note"
+    private let activeWorkspaceKey = "floatmd_active_workspace"
 
     var notes: [Note] = []
     var activeNoteId: UUID?
+    var activeWorkspace: String? {
+        didSet {
+            if let workspace = activeWorkspace {
+                UserDefaults.standard.set(workspace, forKey: activeWorkspaceKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: activeWorkspaceKey)
+            }
+        }
+    }
 
     var activeNote: Note? {
         get { notes.first { $0.id == activeNoteId } }
@@ -65,6 +98,8 @@ class NotesManager {
         if activeNoteId == nil {
             activeNoteId = notes.first?.id
         }
+        // Restore active workspace
+        activeWorkspace = UserDefaults.standard.string(forKey: activeWorkspaceKey)
     }
 
     func createNote() -> Note {
@@ -180,6 +215,71 @@ class NotesManager {
         save()
     }
 
+    // MARK: - Workspace Methods
+
+    func notesForCurrentView() -> [Note] {
+        if let workspace = activeWorkspace {
+            // In workspace view: return notes in this workspace OR child workspaces OR containing "."
+            return notes.filter { note in
+                // Check if note contains global workspace "."
+                if note.workspaces.contains(".") {
+                    return true
+                }
+                // Check if note is in the current workspace or a child workspace
+                return note.workspaces.contains { ws in
+                    ws == workspace || ws.hasPrefix(workspace + "/")
+                }
+            }
+        } else {
+            // Home view: return notes with empty workspaces + notes containing "."
+            return notes.filter { note in
+                note.workspaces.isEmpty || note.workspaces.contains(".")
+            }
+        }
+    }
+
+    func setActiveWorkspace(_ workspace: String?) {
+        activeWorkspace = workspace
+    }
+
+    func getAllWorkspaces() -> [String] {
+        var workspaces = Set<String>()
+        for note in notes {
+            for workspace in note.workspaces {
+                workspaces.insert(workspace)
+            }
+        }
+        return workspaces.sorted()
+    }
+
+    func addWorkspace(to noteId: UUID, workspace: String) {
+        guard let index = notes.firstIndex(where: { $0.id == noteId }) else { return }
+        notes[index].workspaces.insert(workspace)
+        notes[index].modifiedAt = Date()
+        save()
+    }
+
+    func removeWorkspace(from noteId: UUID, workspace: String) {
+        guard let index = notes.firstIndex(where: { $0.id == noteId }) else { return }
+        notes[index].workspaces.remove(workspace)
+        notes[index].modifiedAt = Date()
+        save()
+    }
+
+    func addTag(to noteId: UUID, tag: String) {
+        guard let index = notes.firstIndex(where: { $0.id == noteId }) else { return }
+        notes[index].tags.insert(tag)
+        notes[index].modifiedAt = Date()
+        save()
+    }
+
+    func removeTag(from noteId: UUID, tag: String) {
+        guard let index = notes.firstIndex(where: { $0.id == noteId }) else { return }
+        notes[index].tags.remove(tag)
+        notes[index].modifiedAt = Date()
+        save()
+    }
+
     private func save() {
         if let data = try? JSONEncoder().encode(notes) {
             UserDefaults.standard.set(data, forKey: storageKey)
@@ -193,10 +293,39 @@ class NotesManager {
         if let data = UserDefaults.standard.data(forKey: storageKey),
            let decoded = try? JSONDecoder().decode([Note].self, from: data) {
             notes = decoded.sorted { $0.modifiedAt > $1.modifiedAt }
+
+            // Migration: Parse tags from content for notes that have empty tags field
+            migrateTags()
         }
         if let idString = UserDefaults.standard.string(forKey: activeNoteKey),
            let id = UUID(uuidString: idString) {
             activeNoteId = id
+        }
+    }
+
+    private func migrateTags() {
+        // Parse #tags from content and populate tags field for migration
+        let tagPattern = try! NSRegularExpression(pattern: "#([a-zA-Z][a-zA-Z0-9_-]*)", options: [])
+        var needsSave = false
+
+        for i in 0..<notes.count {
+            // Only migrate if tags field is empty (backward compatibility)
+            if notes[i].tags.isEmpty {
+                let range = NSRange(location: 0, length: notes[i].content.utf16.count)
+                let matches = tagPattern.matches(in: notes[i].content, options: [], range: range)
+
+                for match in matches {
+                    if let tagRange = Range(match.range(at: 1), in: notes[i].content) {
+                        let tag = String(notes[i].content[tagRange])
+                        notes[i].tags.insert(tag)
+                        needsSave = true
+                    }
+                }
+            }
+        }
+
+        if needsSave {
+            save()
         }
     }
 }
@@ -840,6 +969,7 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
     private var headerView: NSView!
     private var newNoteButton: NSButton!
     private var titleButton: NSButton!
+    private var workspaceIndicatorButton: NSButton!
     private var noteBrowserView: NoteBrowserView?
     private var settingsView: SettingsView?
     private var tagSearchView: TagSearchView?
@@ -849,9 +979,12 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
     private var cursorLine: Int = -1
     private var tagAutocompleteView: TagAutocompleteView?
     private var tagAutocompleteStart: Int = 0  // Position of the # character
+    private var workspaceAutocompleteView: WorkspaceAutocompleteView?
+    private var workspaceAutocompleteStart: Int = 0  // Position of the @ character
     private var noteLinkAutocompleteView: NoteLinkAutocompleteView?
     private var noteLinkAutocompleteStart: Int = 0  // Position of the [[ characters
     private var previousTitle: String = ""  // Track title for backlink updates
+    private var metadataBarView: MetadataBarView!
 
     private let baseFont = NSFont.systemFont(ofSize: 14, weight: .regular)
     private let h1Font = NSFont.systemFont(ofSize: 28, weight: .bold)
@@ -908,6 +1041,10 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         // Update button icons with theme color
         newNoteButton.image = tintedSymbol("plus", color: theme.icon)
         titleButton.contentTintColor = theme.text
+
+        // Update workspace indicator styling
+        workspaceIndicatorButton.contentTintColor = workspaceTagColor
+        workspaceIndicatorButton.bezelColor = workspaceTagBackground
     }
 
     private func setupUI() {
@@ -944,8 +1081,20 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         newNoteButton.autoresizingMask = [.minXMargin]
         headerView.addSubview(newNoteButton)
 
+        // Workspace indicator button (adaptive: full path, root, or dot)
+        workspaceIndicatorButton = NSButton(frame: NSRect(x: 70, y: 6, width: 0, height: 24))
+        workspaceIndicatorButton.bezelStyle = .inline
+        workspaceIndicatorButton.isBordered = true
+        workspaceIndicatorButton.setButtonType(.momentaryPushIn)
+        workspaceIndicatorButton.font = .systemFont(ofSize: 12, weight: .medium)
+        workspaceIndicatorButton.target = self
+        workspaceIndicatorButton.action = #selector(showWorkspacePicker)
+        workspaceIndicatorButton.isHidden = true
+        workspaceIndicatorButton.toolTip = ""
+        headerView.addSubview(workspaceIndicatorButton)
+
         // Title button (clickable title that opens browser)
-        // Left margin: 70px (to avoid traffic light buttons), Right margin: 80px (to avoid newNoteButton)
+        // Left margin: 70px (to avoid traffic light buttons) + workspace indicator, Right margin: 80px (to avoid newNoteButton)
         titleButton = DraggableTitleButton(frame: NSRect(x: 70, y: 6, width: bounds.width - 150, height: 24))
         titleButton.bezelStyle = .inline
         titleButton.isBordered = false
@@ -959,7 +1108,7 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         headerView.addSubview(titleButton)
 
         // Text editor
-        scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: bounds.width, height: bounds.height - 36))
+        scrollView = NSScrollView(frame: NSRect(x: 0, y: 28, width: bounds.width, height: bounds.height - 64))
         scrollView.drawsBackground = false
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
@@ -1002,6 +1151,14 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
 
         scrollView.documentView = textView
         addSubview(scrollView)
+
+        // Metadata bar at bottom
+        metadataBarView = MetadataBarView(frame: NSRect(x: 0, y: 0, width: bounds.width, height: 28))
+        metadataBarView.autoresizingMask = [.width, .maxYMargin]
+        metadataBarView.onMetadataChanged = { [weak self] in
+            self?.loadContent()
+        }
+        addSubview(metadataBarView)
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -1011,6 +1168,8 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
             let newWidth = scrollView.contentSize.width
             textContainer.containerSize = NSSize(width: newWidth, height: CGFloat.greatestFiniteMagnitude)
         }
+        // Update workspace indicator for adaptive display
+        updateWorkspaceIndicator()
     }
 
     @objc private func createNewNote() {
@@ -1151,6 +1310,11 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
             autocomplete.confirmSelection()
             return true
         }
+        // If workspace autocomplete is showing, confirm selection
+        if let autocomplete = workspaceAutocompleteView, autocomplete.hasResults {
+            autocomplete.confirmSelection()
+            return true
+        }
         // If tag autocomplete is showing, confirm selection
         if let autocomplete = tagAutocompleteView, autocomplete.hasResults {
             autocomplete.confirmSelection()
@@ -1270,6 +1434,39 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
 
         // Hide note link autocomplete if no [[ found
         hideNoteLinkAutocomplete()
+
+        // Look for @ at or before cursor (workspace autocomplete)
+        if cursorPos > 0 {
+            // Find the start of the current "word" (workspace)
+            var atPos: Int? = nil
+            var filterText = ""
+            for i in stride(from: cursorPos - 1, through: 0, by: -1) {
+                let char = nsText.substring(with: NSRange(location: i, length: 1))
+                if char == "@" {
+                    // Check if preceded by whitespace or at line start (valid workspace position)
+                    let isAtLineStart = (i == 0) || (nsText.substring(with: NSRange(location: i - 1, length: 1)) == "\n")
+                    if isAtLineStart || CharacterSet.whitespaces.contains(Unicode.Scalar(nsText.character(at: i - 1))!) {
+                        atPos = i
+                        break
+                    } else {
+                        break  // @ not at word boundary
+                    }
+                } else if char.rangeOfCharacter(from: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-/.")) ) == nil {
+                    break  // Non-workspace character found (allowing / for paths and . for global)
+                }
+                filterText = char + filterText
+            }
+
+            if let pos = atPos {
+                workspaceAutocompleteStart = pos
+                showWorkspaceAutocomplete(filter: filterText)
+                hideTagAutocomplete()
+                return
+            }
+        }
+
+        // Hide workspace autocomplete if no @ found
+        hideWorkspaceAutocomplete()
 
         // Look for # at or before cursor (tag autocomplete)
         if cursorPos > 0 {
@@ -1425,9 +1622,74 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         DispatchQueue.main.async { [weak self] in self?.applyMarkdownFormatting() }
     }
 
+    private func showWorkspaceAutocomplete(filter: String) {
+        let allWorkspaces = NotesManager.shared.getAllWorkspaces()
+
+        if workspaceAutocompleteView == nil {
+            let autocomplete = WorkspaceAutocompleteView(frame: NSRect(x: 0, y: 0, width: 200, height: 120))
+            autocomplete.onSelectWorkspace = { [weak self] workspace in
+                self?.insertWorkspace(workspace)
+            }
+            autocomplete.onDismiss = { [weak self] in
+                self?.hideWorkspaceAutocomplete()
+            }
+            addSubview(autocomplete)
+            workspaceAutocompleteView = autocomplete
+        }
+
+        workspaceAutocompleteView?.updateWorkspaces(allWorkspaces: allWorkspaces, filter: filter)
+
+        if workspaceAutocompleteView?.hasResults == false {
+            hideWorkspaceAutocomplete()
+            return
+        }
+
+        // Position below cursor
+        let cursorRect = textView.firstRect(forCharacterRange: NSRange(location: workspaceAutocompleteStart, length: 1), actualRange: nil)
+        if !cursorRect.isNull {
+            let windowRect = window?.convertFromScreen(cursorRect) ?? cursorRect
+            let localPoint = convert(windowRect.origin, from: nil)
+            workspaceAutocompleteView?.frame = NSRect(x: max(10, localPoint.x), y: localPoint.y - 125, width: 200, height: 120)
+        }
+    }
+
+    private func hideWorkspaceAutocomplete() {
+        workspaceAutocompleteView?.removeFromSuperview()
+        workspaceAutocompleteView = nil
+    }
+
+    private func insertWorkspace(_ workspace: String) {
+        guard let textStorage = textView.textStorage else { return }
+        let cursorPos = textView.selectedRange().location
+        // Replace from @ to cursor with the full workspace
+        let replaceRange = NSRange(location: workspaceAutocompleteStart, length: cursorPos - workspaceAutocompleteStart)
+        isUpdatingFormatting = true
+        textStorage.replaceCharacters(in: replaceRange, with: "@\(workspace) ")
+        textView.setSelectedRange(NSRange(location: workspaceAutocompleteStart + workspace.count + 2, length: 0))
+        isUpdatingFormatting = false
+        hideWorkspaceAutocomplete()
+
+        // Add workspace to note's metadata
+        if let noteId = NotesManager.shared.activeNoteId {
+            NotesManager.shared.addWorkspace(to: noteId, workspace: workspace)
+        }
+
+        saveContent()
+        DispatchQueue.main.async { [weak self] in self?.applyMarkdownFormatting() }
+    }
+
     private func handleArrowKey(isDown: Bool) -> Bool {
         // Check note link autocomplete first
         if let autocomplete = noteLinkAutocompleteView {
+            if isDown {
+                autocomplete.selectNext()
+            } else {
+                autocomplete.selectPrevious()
+            }
+            return true
+        }
+        // Then check workspace autocomplete
+        if let autocomplete = workspaceAutocompleteView {
             if isDown {
                 autocomplete.selectNext()
             } else {
@@ -1448,6 +1710,10 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
     private func handleEscapeKey() -> Bool {
         if noteLinkAutocompleteView != nil {
             hideNoteLinkAutocomplete()
+            return true
+        }
+        if workspaceAutocompleteView != nil {
+            hideWorkspaceAutocomplete()
             return true
         }
         if tagAutocompleteView != nil {
@@ -1891,8 +2157,102 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
             textView.string = note.content
             previousTitle = note.title
             titleButton.title = note.title
+            updateWorkspaceIndicator()
+            metadataBarView.updateForNote(note)
             applyMarkdownFormatting()
+        } else {
+            metadataBarView.updateForNote(nil)
         }
+    }
+
+    private func updateWorkspaceIndicator() {
+        guard let workspace = NotesManager.shared.activeWorkspace else {
+            workspaceIndicatorButton.isHidden = true
+            titleButton.frame.origin.x = 70
+            titleButton.frame.size.width = bounds.width - 150
+            return
+        }
+
+        workspaceIndicatorButton.isHidden = false
+
+        // Calculate available width for workspace indicator
+        let availableWidth = bounds.width - 150  // Total space between traffic lights and + button
+        let titleWidth = (titleButton.title as NSString).size(withAttributes: [.font: titleButton.font!]).width
+        let spaceForIndicator = availableWidth - titleWidth - 20  // 20px padding between indicator and title
+
+        var displayText = ""
+        var buttonWidth: CGFloat = 0
+
+        // Adaptive display based on available space
+        if spaceForIndicator < 40 {
+            // Very cramped: show colored dot only
+            displayText = "●"
+            buttonWidth = 30
+            workspaceIndicatorButton.toolTip = "[@\(workspace)]"
+        } else if spaceForIndicator < 100 {
+            // Tight space: show root workspace only
+            let root = workspace.components(separatedBy: "/").first ?? workspace
+            displayText = "[@\(root)]"
+            buttonWidth = (displayText as NSString).size(withAttributes: [.font: workspaceIndicatorButton.font!]).width + 16
+            workspaceIndicatorButton.toolTip = "[@\(workspace)]"
+        } else {
+            // Plenty of space: show full workspace path
+            displayText = "[@\(workspace)]"
+            buttonWidth = (displayText as NSString).size(withAttributes: [.font: workspaceIndicatorButton.font!]).width + 16
+            workspaceIndicatorButton.toolTip = ""
+        }
+
+        workspaceIndicatorButton.title = displayText
+        workspaceIndicatorButton.frame.size.width = buttonWidth
+
+        // Adjust title button position to make room for workspace indicator
+        let indicatorX: CGFloat = 70
+        let titleX = indicatorX + buttonWidth + 6  // 6px gap
+        workspaceIndicatorButton.frame.origin.x = indicatorX
+        titleButton.frame.origin.x = titleX
+        titleButton.frame.size.width = bounds.width - titleX - 80
+    }
+
+    @objc private func showWorkspacePicker() {
+        let menu = NSMenu()
+
+        // Get all workspaces
+        let workspaces = NotesManager.shared.getAllWorkspaces().sorted()
+
+        // Add workspace options
+        for workspace in workspaces {
+            let item = NSMenuItem(title: "[@\(workspace)]", action: #selector(selectWorkspace(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = workspace
+            item.state = NotesManager.shared.activeWorkspace == workspace ? .on : .off
+            menu.addItem(item)
+        }
+
+        // Add separator and "Exit to Home" option
+        if !workspaces.isEmpty {
+            menu.addItem(NSMenuItem.separator())
+        }
+
+        let exitItem = NSMenuItem(title: "Exit to Home", action: #selector(exitWorkspace), keyEquivalent: "")
+        exitItem.target = self
+        menu.addItem(exitItem)
+
+        // Show menu at button
+        let location = NSPoint(x: workspaceIndicatorButton.frame.origin.x,
+                              y: workspaceIndicatorButton.frame.origin.y)
+        menu.popUp(positioning: nil, at: location, in: headerView)
+    }
+
+    @objc private func selectWorkspace(_ sender: NSMenuItem) {
+        if let workspace = sender.representedObject as? String {
+            NotesManager.shared.setActiveWorkspace(workspace)
+            updateWorkspaceIndicator()
+        }
+    }
+
+    @objc private func exitWorkspace() {
+        NotesManager.shared.setActiveWorkspace(nil)
+        updateWorkspaceIndicator()
     }
 
     private func navigateToNote(titled title: String) {
@@ -1995,13 +2355,18 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
     func deleteSelectedTextOrClearContent() {
         let selectedRange = textView.selectedRange()
         if selectedRange.length > 0 {
-            // Delete only the selected text
-            if let textStorage = textView.textStorage {
-                textStorage.replaceCharacters(in: selectedRange, with: "")
+            // Delete only the selected text - use proper undo-aware method
+            if textView.shouldChangeText(in: selectedRange, replacementString: "") {
+                textView.replaceCharacters(in: selectedRange, with: "")
+                textView.didChangeText()
             }
         } else {
-            // Clear the entire note
-            textView.string = ""
+            // Clear the entire note - use proper undo-aware method
+            let fullRange = NSRange(location: 0, length: (textView.string as NSString).length)
+            if textView.shouldChangeText(in: fullRange, replacementString: "") {
+                textView.replaceCharacters(in: fullRange, with: "")
+                textView.didChangeText()
+            }
         }
         // Save the changes
         NotesManager.shared.updateActiveNote(content: textView.string)
@@ -2112,6 +2477,127 @@ extension TagAutocompleteView: NSTableViewDelegate, NSTableViewDataSource {
         let label = NSTextField(labelWithString: "#\(tag)")
         label.font = .systemFont(ofSize: 13)
         label.textColor = NSColor(calibratedRed: 0.4, green: 0.75, blue: 0.6, alpha: 1.0)
+        label.frame = NSRect(x: 8, y: 2, width: cell.bounds.width - 16, height: 20)
+        label.isEditable = false
+        label.isSelectable = false
+        cell.addSubview(label)
+
+        return cell
+    }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let rowView = NSTableRowView()
+        rowView.isEmphasized = false
+        return rowView
+    }
+}
+
+// MARK: - Workspace Autocomplete View
+class WorkspaceAutocompleteView: NSView {
+    private var tableView: NSTableView!
+    private var scrollView: NSScrollView!
+    private var workspaces: [String] = []
+    private var filteredWorkspaces: [String] = []
+    var onSelectWorkspace: ((String) -> Void)?
+    var onDismiss: (() -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        setupUI()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func setupUI() {
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(white: 0.15, alpha: 0.95).cgColor
+        layer?.cornerRadius = 6
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.2).cgColor
+
+        scrollView = NSScrollView(frame: bounds.insetBy(dx: 2, dy: 2))
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autoresizingMask = [.width, .height]
+
+        tableView = NSTableView()
+        tableView.backgroundColor = .clear
+        tableView.headerView = nil
+        tableView.rowHeight = 24
+        tableView.delegate = self
+        tableView.dataSource = self
+        tableView.target = self
+        tableView.action = #selector(tableClicked)
+        tableView.intercellSpacing = NSSize(width: 0, height: 2)
+
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("workspace"))
+        column.width = bounds.width - 20
+        tableView.addTableColumn(column)
+
+        scrollView.documentView = tableView
+        addSubview(scrollView)
+    }
+
+    func updateWorkspaces(allWorkspaces: [String], filter: String) {
+        // Always include "." for global workspace
+        var workspaceList = allWorkspaces
+        if !workspaceList.contains(".") {
+            workspaceList.insert(".", at: 0)
+        }
+        workspaces = workspaceList
+
+        if filter.isEmpty {
+            filteredWorkspaces = workspaces
+        } else {
+            let lowercased = filter.lowercased()
+            filteredWorkspaces = workspaces.filter { $0.lowercased().hasPrefix(lowercased) }
+        }
+        tableView.reloadData()
+        if !filteredWorkspaces.isEmpty {
+            tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        }
+    }
+
+    func selectNext() {
+        let current = tableView.selectedRow
+        if current < filteredWorkspaces.count - 1 {
+            tableView.selectRowIndexes(IndexSet(integer: current + 1), byExtendingSelection: false)
+            tableView.scrollRowToVisible(current + 1)
+        }
+    }
+
+    func selectPrevious() {
+        let current = tableView.selectedRow
+        if current > 0 {
+            tableView.selectRowIndexes(IndexSet(integer: current - 1), byExtendingSelection: false)
+            tableView.scrollRowToVisible(current - 1)
+        }
+    }
+
+    func confirmSelection() {
+        let row = tableView.selectedRow
+        if row >= 0 && row < filteredWorkspaces.count {
+            onSelectWorkspace?(filteredWorkspaces[row])
+        }
+    }
+
+    @objc private func tableClicked() {
+        confirmSelection()
+    }
+
+    var hasResults: Bool { !filteredWorkspaces.isEmpty }
+}
+
+extension WorkspaceAutocompleteView: NSTableViewDelegate, NSTableViewDataSource {
+    func numberOfRows(in tableView: NSTableView) -> Int { filteredWorkspaces.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let workspace = filteredWorkspaces[row]
+        let cell = NSView(frame: NSRect(x: 0, y: 0, width: tableView.bounds.width, height: 24))
+
+        let label = NSTextField(labelWithString: "@\(workspace)")
+        label.font = .systemFont(ofSize: 13)
+        label.textColor = NSColor(calibratedRed: 0.6, green: 0.5, blue: 0.9, alpha: 1.0)
         label.frame = NSRect(x: 8, y: 2, width: cell.bounds.width - 16, height: 20)
         label.isEditable = false
         label.isSelectable = false
@@ -2560,6 +3046,307 @@ class TagSearchView: NSView {
     }
 }
 
+// MARK: - Metadata Bar View
+class MetadataBarView: NSView {
+    private var tagPillsContainer: NSView!
+    private var workspacePillsContainer: NSView!
+    private var addButton: NSButton!
+    private var currentNote: Note?
+    private var autocompleteView: NSView?
+    private var autocompleteTextField: NSTextField?
+
+    var onMetadataChanged: (() -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        setupUI()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    private func setupUI() {
+        let theme = ThemeManager.shared.currentTheme
+
+        wantsLayer = true
+        layer?.backgroundColor = theme.background.cgColor
+
+        // Container for tag pills (left side)
+        tagPillsContainer = NSView(frame: NSRect(x: 10, y: 2, width: bounds.width / 2 - 30, height: 24))
+        tagPillsContainer.autoresizingMask = [.width]
+        addSubview(tagPillsContainer)
+
+        // Container for workspace pills (right side)
+        workspacePillsContainer = NSView(frame: NSRect(x: bounds.width / 2, y: 2, width: bounds.width / 2 - 40, height: 24))
+        workspacePillsContainer.autoresizingMask = [.minXMargin, .width]
+        addSubview(workspacePillsContainer)
+
+        // Add button (far right)
+        addButton = NSButton(frame: NSRect(x: bounds.width - 28, y: 2, width: 24, height: 24))
+        addButton.bezelStyle = .inline
+        addButton.isBordered = false
+        addButton.image = tintedSymbol("plus.circle", color: theme.icon)
+        addButton.target = self
+        addButton.action = #selector(showAddMetadataPopup)
+        addButton.autoresizingMask = [.minXMargin]
+        addSubview(addButton)
+
+        NotificationCenter.default.addObserver(self, selector: #selector(themeDidChange), name: .themeDidChange, object: nil)
+    }
+
+    @objc private func themeDidChange() {
+        let theme = ThemeManager.shared.currentTheme
+        layer?.backgroundColor = theme.background.cgColor
+        addButton.image = tintedSymbol("plus.circle", color: theme.icon)
+        updateForNote(currentNote)
+    }
+
+    func updateForNote(_ note: Note?) {
+        currentNote = note
+
+        // Clear existing pills
+        tagPillsContainer.subviews.forEach { $0.removeFromSuperview() }
+        workspacePillsContainer.subviews.forEach { $0.removeFromSuperview() }
+
+        guard let note = note else { return }
+
+        let theme = ThemeManager.shared.currentTheme
+
+        // Create tag pills
+        var tagX: CGFloat = 0
+        for tag in note.tags.sorted() {
+            let pill = createPill(
+                text: "#\(tag)",
+                textColor: theme.tag,
+                backgroundColor: theme.tagBackground,
+                onRemove: { [weak self] in
+                    self?.removeTag(tag)
+                }
+            )
+            pill.frame.origin = CGPoint(x: tagX, y: 0)
+            tagPillsContainer.addSubview(pill)
+            tagX += pill.frame.width + 6
+        }
+
+        // Create workspace pills
+        var workspaceX: CGFloat = 0
+        for workspace in note.workspaces.sorted() {
+            let pill = createPill(
+                text: "@\(workspace)",
+                textColor: theme.workspaceTag,
+                backgroundColor: theme.workspaceTagBackground,
+                onRemove: { [weak self] in
+                    self?.removeWorkspace(workspace)
+                }
+            )
+            pill.frame.origin = CGPoint(x: workspaceX, y: 0)
+            workspacePillsContainer.addSubview(pill)
+            workspaceX += pill.frame.width + 6
+        }
+    }
+
+    private func createPill(text: String, textColor: NSColor, backgroundColor: NSColor, onRemove: @escaping () -> Void) -> NSView {
+        let theme = ThemeManager.shared.currentTheme
+
+        // Create pill container
+        let pill = NSView()
+        pill.wantsLayer = true
+        pill.layer?.backgroundColor = backgroundColor.cgColor
+        pill.layer?.cornerRadius = 10
+
+        // Create label
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 11, weight: .medium)
+        label.textColor = textColor
+        label.frame = NSRect(x: 8, y: 2, width: 0, height: 18)
+        label.sizeToFit()
+
+        // Create close button
+        let closeButton = NSButton(frame: NSRect(x: label.frame.width + 10, y: 2, width: 16, height: 16))
+        closeButton.bezelStyle = .inline
+        closeButton.isBordered = false
+        closeButton.image = tintedSymbol("xmark", color: textColor.withAlphaComponent(0.7))
+        closeButton.target = nil
+        closeButton.action = nil
+
+        // Create clickable overlay for remove action
+        let clickOverlay = NSView(frame: NSRect(x: label.frame.width + 10, y: 2, width: 16, height: 16))
+
+        // Use a tracking area for hover
+        let trackingArea = NSTrackingArea(
+            rect: clickOverlay.bounds,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: pill,
+            userInfo: ["action": onRemove as Any]
+        )
+        clickOverlay.addTrackingArea(trackingArea)
+
+        // Store the remove action for mouse down
+        objc_setAssociatedObject(pill, "removeAction", onRemove as Any, .OBJC_ASSOCIATION_RETAIN)
+
+        // Size the pill
+        let totalWidth = label.frame.width + 30
+        pill.frame = NSRect(x: 0, y: 0, width: totalWidth, height: 20)
+        label.frame.origin.y = 1
+        closeButton.frame.origin.y = 2
+        clickOverlay.frame.origin.y = 2
+
+        pill.addSubview(label)
+        pill.addSubview(closeButton)
+        pill.addSubview(clickOverlay)
+
+        return pill
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+
+        // Check if click is on any pill's close button area
+        for pillContainer in [tagPillsContainer, workspacePillsContainer] {
+            for pill in pillContainer!.subviews {
+                let pillLocation = pill.convert(location, from: self)
+                if pill.bounds.contains(pillLocation) {
+                    // Check if it's in the close button area (right side of pill)
+                    if pillLocation.x > pill.bounds.width - 24 {
+                        if let action = objc_getAssociatedObject(pill, "removeAction") as? () -> Void {
+                            action()
+                            return
+                        }
+                    }
+                }
+            }
+        }
+
+        super.mouseDown(with: event)
+    }
+
+    private func removeTag(_ tag: String) {
+        guard let noteId = currentNote?.id else { return }
+        NotesManager.shared.removeTag(from: noteId, tag: tag)
+        currentNote = NotesManager.shared.notes.first { $0.id == noteId }
+        updateForNote(currentNote)
+        onMetadataChanged?()
+    }
+
+    private func removeWorkspace(_ workspace: String) {
+        guard let noteId = currentNote?.id else { return }
+        NotesManager.shared.removeWorkspace(from: noteId, workspace: workspace)
+        currentNote = NotesManager.shared.notes.first { $0.id == noteId }
+        updateForNote(currentNote)
+        onMetadataChanged?()
+    }
+
+    @objc private func showAddMetadataPopup() {
+        guard currentNote != nil else { return }
+
+        let theme = ThemeManager.shared.currentTheme
+
+        // Create popup view - position ABOVE the metadata bar (y = 28 to place above this view)
+        let popupView = NSView(frame: NSRect(x: bounds.width - 220, y: 28, width: 210, height: 100))
+        popupView.wantsLayer = true
+        popupView.layer?.backgroundColor = theme.background.cgColor
+        popupView.layer?.cornerRadius = 8
+        popupView.layer?.borderWidth = 1
+        popupView.layer?.borderColor = theme.secondaryText.withAlphaComponent(0.3).cgColor
+
+        // Instructions label
+        let instructionsLabel = NSTextField(labelWithString: "Type # for tags, @ for workspaces")
+        instructionsLabel.font = .systemFont(ofSize: 10)
+        instructionsLabel.textColor = theme.secondaryText
+        instructionsLabel.frame = NSRect(x: 10, y: 70, width: 190, height: 20)
+        instructionsLabel.isEditable = false
+        instructionsLabel.isBordered = false
+        instructionsLabel.drawsBackground = false
+        popupView.addSubview(instructionsLabel)
+
+        // Text field - must be editable
+        let textField = NSTextField(frame: NSRect(x: 10, y: 40, width: 190, height: 24))
+        textField.isEditable = true
+        textField.isSelectable = true
+        textField.isBezeled = true
+        textField.bezelStyle = .roundedBezel
+        textField.font = .systemFont(ofSize: 13)
+        textField.textColor = theme.text
+        textField.backgroundColor = theme.codeBackground
+        textField.focusRingType = .default
+        textField.placeholderString = "#tag or @workspace"
+        textField.target = self
+        textField.action = #selector(addMetadataFromTextField(_:))
+        popupView.addSubview(textField)
+
+        // Cancel button
+        let cancelButton = NSButton(frame: NSRect(x: 10, y: 10, width: 60, height: 24))
+        cancelButton.title = "Cancel"
+        cancelButton.bezelStyle = .rounded
+        cancelButton.target = self
+        cancelButton.action = #selector(hideAddMetadataPopup)
+        popupView.addSubview(cancelButton)
+
+        // Add button
+        let addButtonInPopup = NSButton(frame: NSRect(x: 140, y: 10, width: 60, height: 24))
+        addButtonInPopup.title = "Add"
+        addButtonInPopup.bezelStyle = .rounded
+        addButtonInPopup.keyEquivalent = "\r"
+        addButtonInPopup.target = self
+        addButtonInPopup.action = #selector(addMetadataFromTextField(_:))
+        popupView.addSubview(addButtonInPopup)
+
+        // Add to superview (MainView) instead of self so it's not clipped
+        if let mainView = superview {
+            // Convert position to MainView coordinates
+            let popupOrigin = convert(NSPoint(x: bounds.width - 220, y: bounds.height), to: mainView)
+            popupView.frame.origin = popupOrigin
+            mainView.addSubview(popupView)
+        } else {
+            addSubview(popupView)
+        }
+
+        autocompleteView = popupView
+        autocompleteTextField = textField
+
+        // Make text field first responder after a short delay to ensure window is ready
+        DispatchQueue.main.async { [weak self] in
+            self?.window?.makeFirstResponder(textField)
+        }
+    }
+
+    @objc private func hideAddMetadataPopup() {
+        autocompleteView?.removeFromSuperview()
+        autocompleteView = nil
+        autocompleteTextField = nil
+    }
+
+    @objc private func addMetadataFromTextField(_ sender: Any?) {
+        guard let text = autocompleteTextField?.stringValue.trimmingCharacters(in: .whitespaces),
+              !text.isEmpty,
+              let noteId = currentNote?.id else {
+            hideAddMetadataPopup()
+            return
+        }
+
+        if text.hasPrefix("#") {
+            let tag = String(text.dropFirst()).trimmingCharacters(in: .whitespaces)
+            if !tag.isEmpty {
+                NotesManager.shared.addTag(to: noteId, tag: tag)
+            }
+        } else if text.hasPrefix("@") {
+            let workspace = String(text.dropFirst()).trimmingCharacters(in: .whitespaces)
+            if !workspace.isEmpty {
+                NotesManager.shared.addWorkspace(to: noteId, workspace: workspace)
+            }
+        } else {
+            // Default to tag if no prefix
+            NotesManager.shared.addTag(to: noteId, tag: text)
+        }
+
+        currentNote = NotesManager.shared.notes.first { $0.id == noteId }
+        updateForNote(currentNote)
+        onMetadataChanged?()
+        hideAddMetadataPopup()
+    }
+}
+
 // Helper for clickable cards
 class ClickableView: NSView {
     var onClick: (() -> Void)?
@@ -2932,6 +3719,13 @@ class SettingsView: NSView {
 }
 
 // MARK: - Note Browser View
+// Mixed data model for NoteBrowserView rows
+enum BrowserRow {
+    case note(Note)
+    case workspace(name: String, count: Int)
+    case backButton
+}
+
 class NoteBrowserView: NSView, NSTextFieldDelegate {
     private var scrollView: NSScrollView!
     private var tableView: NSTableView!
@@ -2939,13 +3733,19 @@ class NoteBrowserView: NSView, NSTextFieldDelegate {
     private var tagPillsView: NSView!
     private var tagAutocompleteView: TagAutocompleteView?
     private var settingsButton: NSButton!
-    private var notes: [Note] = []
+    private var rows: [BrowserRow] = []
     private var selectedTags: [String] = []
     private var tagAutocompleteStart: Int = 0
     var onSelectNote: ((Note) -> Void)?
     var onDeleteNote: ((Note) -> Void)?
     var onPinNote: ((Note) -> Void)?
     var onSettings: (() -> Void)?
+
+    // Selection mode for mass-adding notes to workspace
+    private var isSelectingForWorkspace: Bool = false
+    private var targetWorkspace: String? = nil
+    private var selectedNoteIds: Set<UUID> = []
+    private var selectionBanner: NSView?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -3001,7 +3801,6 @@ class NoteBrowserView: NSView, NSTextFieldDelegate {
         tableView = NSTableView()
         tableView.backgroundColor = .clear
         tableView.headerView = nil
-        tableView.rowHeight = 50
         tableView.delegate = self
         tableView.dataSource = self
         tableView.target = self
@@ -3147,8 +3946,80 @@ class NoteBrowserView: NSView, NSTextFieldDelegate {
     }
 
     private func performSearch() {
-        notes = NotesManager.shared.searchNotes(query: searchField.stringValue, tags: selectedTags)
+        let searchQuery = searchField.stringValue
+        let isSearching = !searchQuery.isEmpty || !selectedTags.isEmpty
+
+        // When searching, always search globally across all notes
+        if isSearching {
+            let notes = NotesManager.shared.searchNotes(query: searchQuery, tags: selectedTags)
+            rows = notes.map { .note($0) }
+            tableView.reloadData()
+            return
+        }
+
+        // Not searching - show workspace-aware view
+        rows = []
+        let manager = NotesManager.shared
+        let currentWorkspace = manager.activeWorkspace
+
+        if let workspace = currentWorkspace {
+            // In workspace view
+            // Add back button
+            rows.append(.backButton)
+
+            // Get notes for current workspace (includes children and global)
+            let notes = manager.notesForCurrentView()
+            rows.append(contentsOf: notes.map { .note($0) })
+
+            // Find child workspaces
+            let childWorkspaces = getChildWorkspaces(of: workspace)
+            for childWorkspace in childWorkspaces {
+                let count = manager.notes.filter { note in
+                    note.workspaces.contains(childWorkspace)
+                }.count
+                rows.append(.workspace(name: childWorkspace, count: count))
+            }
+        } else {
+            // Home view
+            // Get uncategorized and global notes
+            let notes = manager.notesForCurrentView()
+            rows.append(contentsOf: notes.map { .note($0) })
+
+            // Get root workspaces (those without "/" in the name, excluding ".")
+            let allWorkspaces = manager.getAllWorkspaces()
+            let rootWorkspaces = allWorkspaces.filter { workspace in
+                !workspace.contains("/") && workspace != "."
+            }
+
+            for workspace in rootWorkspaces {
+                let count = manager.notes.filter { note in
+                    note.workspaces.contains { ws in
+                        ws == workspace || ws.hasPrefix(workspace + "/")
+                    }
+                }.count
+                rows.append(.workspace(name: workspace, count: count))
+            }
+        }
+
         tableView.reloadData()
+    }
+
+    private func getChildWorkspaces(of parent: String) -> [String] {
+        let allWorkspaces = NotesManager.shared.getAllWorkspaces()
+        let prefix = parent + "/"
+
+        // Find direct children only (not grandchildren)
+        var children = Set<String>()
+        for workspace in allWorkspaces {
+            if workspace.hasPrefix(prefix) {
+                let remainder = String(workspace.dropFirst(prefix.count))
+                if !remainder.contains("/") {
+                    children.insert(workspace)
+                }
+            }
+        }
+
+        return children.sorted()
     }
 
     func reloadNotes() {
@@ -3177,18 +4048,148 @@ class NoteBrowserView: NSView, NSTextFieldDelegate {
 }
 
 extension NoteBrowserView: NSTableViewDelegate, NSTableViewDataSource {
-    func numberOfRows(in tableView: NSTableView) -> Int { notes.count }
+    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        guard row >= 0 && row < rows.count else { return 50 }
+        let browserRow = rows[row]
+
+        switch browserRow {
+        case .backButton:
+            return 40
+        case .workspace:
+            return 40
+        case .note:
+            return 50
+        }
+    }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let note = notes[row]
+        guard row >= 0 && row < rows.count else { return nil }
+        let browserRow = rows[row]
         let theme = ThemeManager.shared.currentTheme
+
+        switch browserRow {
+        case .backButton:
+            return createBackButtonCell(theme: theme)
+        case .workspace(let name, let count):
+            return createWorkspaceCell(name: name, count: count, theme: theme)
+        case .note(let note):
+            return createNoteCell(note: note, row: row, theme: theme)
+        }
+    }
+
+    private func createBackButtonCell(theme: Theme) -> NSView {
+        let cell = NSView(frame: NSRect(x: 0, y: 0, width: tableView.bounds.width, height: 40))
+
+        let workspace = NotesManager.shared.activeWorkspace ?? "Home"
+        let label = NSTextField(labelWithString: "← \(workspace)")
+        label.font = .systemFont(ofSize: 14, weight: .medium)
+        label.textColor = theme.secondaryText
+        label.frame = NSRect(x: 10, y: 10, width: cell.bounds.width - 20, height: 20)
+        label.autoresizingMask = [.width]
+        cell.addSubview(label)
+
+        let clickButton = NSButton(frame: cell.bounds)
+        clickButton.autoresizingMask = [.width, .height]
+        clickButton.bezelStyle = .inline
+        clickButton.isBordered = false
+        clickButton.isTransparent = true
+        clickButton.title = ""
+        clickButton.target = self
+        clickButton.action = #selector(exitWorkspace)
+        cell.addSubview(clickButton)
+
+        return cell
+    }
+
+    private func createWorkspaceCell(name: String, count: Int, theme: Theme) -> NSView {
+        let cell = NSView(frame: NSRect(x: 0, y: 0, width: tableView.bounds.width, height: 40))
+
+        let icon = NSTextField(labelWithString: "📁")
+        icon.font = .systemFont(ofSize: 16)
+        icon.frame = NSRect(x: 10, y: 10, width: 20, height: 20)
+        cell.addSubview(icon)
+
+        let label = NSTextField(labelWithString: "@\(name) (\(count))")
+        label.font = .systemFont(ofSize: 14, weight: .medium)
+        label.textColor = theme.workspaceTag
+        label.frame = NSRect(x: 35, y: 10, width: cell.bounds.width - 100, height: 20)
+        label.autoresizingMask = [.width]
+        cell.addSubview(label)
+
+        // Add "+" button for mass-add mode
+        let addBtn = NSButton(frame: NSRect(x: cell.bounds.width - 55, y: 10, width: 20, height: 20))
+        addBtn.autoresizingMask = [.minXMargin]
+        addBtn.bezelStyle = .inline
+        addBtn.isBordered = false
+        addBtn.image = tintedSymbol("plus.circle", color: theme.icon)
+        addBtn.target = self
+        addBtn.action = #selector(startAddingToWorkspace(_:))
+        addBtn.identifier = NSUserInterfaceItemIdentifier(name)
+        addBtn.toolTip = "Add notes to this workspace"
+        cell.addSubview(addBtn)
+
+        let arrow = NSTextField(labelWithString: "▶")
+        arrow.font = .systemFont(ofSize: 12)
+        arrow.textColor = theme.secondaryText
+        arrow.frame = NSRect(x: cell.bounds.width - 30, y: 10, width: 20, height: 20)
+        arrow.autoresizingMask = [.minXMargin]
+        cell.addSubview(arrow)
+
+        let clickButton = NSButton(frame: NSRect(x: 0, y: 0, width: cell.bounds.width - 60, height: 40))
+        clickButton.autoresizingMask = [.width, .height]
+        clickButton.bezelStyle = .inline
+        clickButton.isBordered = false
+        clickButton.isTransparent = true
+        clickButton.title = ""
+        clickButton.target = self
+        clickButton.action = #selector(enterWorkspace(_:))
+        clickButton.identifier = NSUserInterfaceItemIdentifier(name)
+        cell.addSubview(clickButton)
+
+        return cell
+    }
+
+    private func createNoteCell(note: Note, row: Int, theme: Theme) -> NSView {
         let cell = NSView(frame: NSRect(x: 0, y: 0, width: tableView.bounds.width, height: 50))
+
+        // Check if note is global
+        let isGlobal = note.workspaces.contains(".")
+
+        // Add globe icon for global notes (or checkbox in selection mode)
+        var titleX: CGFloat = 10
+        if isSelectingForWorkspace {
+            // Show checkbox
+            let isSelected = selectedNoteIds.contains(note.id)
+            let checkboxIcon = NSTextField(labelWithString: isSelected ? "☑" : "☐")
+            checkboxIcon.font = .systemFont(ofSize: 16)
+            checkboxIcon.frame = NSRect(x: 10, y: 25, width: 18, height: 20)
+            checkboxIcon.isEditable = false
+            checkboxIcon.isSelectable = false
+            cell.addSubview(checkboxIcon)
+            titleX = 32
+        } else if isGlobal {
+            let globeIcon = NSTextField(labelWithString: "🌐")
+            globeIcon.font = .systemFont(ofSize: 12)
+            globeIcon.frame = NSRect(x: 10, y: 25, width: 18, height: 20)
+            globeIcon.isEditable = false
+            globeIcon.isSelectable = false
+            cell.addSubview(globeIcon)
+            titleX = 32
+        }
+
+        // Highlight background if selected in selection mode
+        if isSelectingForWorkspace && selectedNoteIds.contains(note.id) {
+            cell.wantsLayer = true
+            cell.layer?.backgroundColor = NSColor.selectedContentBackgroundColor.withAlphaComponent(0.2).cgColor
+        }
 
         // Labels first (at back)
         let titleLabel = NSTextField(labelWithString: note.title)
         titleLabel.font = .systemFont(ofSize: 14, weight: .medium)
         titleLabel.textColor = theme.text
-        titleLabel.frame = NSRect(x: 10, y: 25, width: cell.bounds.width - 70, height: 20)
+        titleLabel.frame = NSRect(x: titleX, y: 25, width: cell.bounds.width - titleX - 60, height: 20)
         titleLabel.autoresizingMask = [.width]
         titleLabel.isEditable = false
         titleLabel.isSelectable = false
@@ -3200,77 +4201,211 @@ extension NoteBrowserView: NSTableViewDelegate, NSTableViewDataSource {
         let infoLabel = NSTextField(labelWithString: "\(dateStr) • \(note.characterCount) chars")
         infoLabel.font = .systemFont(ofSize: 11)
         infoLabel.textColor = theme.secondaryText
-        infoLabel.frame = NSRect(x: 10, y: 5, width: cell.bounds.width - 70, height: 16)
+        infoLabel.frame = NSRect(x: titleX, y: 5, width: cell.bounds.width - titleX - 60, height: 16)
         infoLabel.autoresizingMask = [.width]
         infoLabel.isEditable = false
         infoLabel.isSelectable = false
         cell.addSubview(infoLabel)
 
-        // Select button - covers left side, on top of labels
-        let selectBtn = NSButton(frame: NSRect(x: 0, y: 0, width: cell.bounds.width - 60, height: 50))
-        selectBtn.autoresizingMask = [.width]
-        selectBtn.bezelStyle = .inline
-        selectBtn.isBordered = false
-        selectBtn.isTransparent = true
-        selectBtn.title = ""
-        selectBtn.tag = row
-        selectBtn.target = self
-        selectBtn.action = #selector(selectNote(_:))
-        cell.addSubview(selectBtn)
+        if isSelectingForWorkspace {
+            // In selection mode, clicking anywhere toggles selection
+            let selectBtn = NSButton(frame: cell.bounds)
+            selectBtn.autoresizingMask = [.width, .height]
+            selectBtn.bezelStyle = .inline
+            selectBtn.isBordered = false
+            selectBtn.isTransparent = true
+            selectBtn.title = ""
+            selectBtn.tag = row
+            selectBtn.target = self
+            selectBtn.action = #selector(toggleNoteSelection(_:))
+            cell.addSubview(selectBtn)
+        } else {
+            // Normal mode - select button and action buttons
+            let selectBtn = NSButton(frame: NSRect(x: 0, y: 0, width: cell.bounds.width - 60, height: 50))
+            selectBtn.autoresizingMask = [.width]
+            selectBtn.bezelStyle = .inline
+            selectBtn.isBordered = false
+            selectBtn.isTransparent = true
+            selectBtn.title = ""
+            selectBtn.tag = row
+            selectBtn.target = self
+            selectBtn.action = #selector(selectNote(_:))
+            cell.addSubview(selectBtn)
 
-        // Pin button - on top of select button
-        let pinBtn = NSButton(frame: NSRect(x: cell.bounds.width - 55, y: 15, width: 20, height: 20))
-        pinBtn.autoresizingMask = [.minXMargin]
-        pinBtn.bezelStyle = .inline
-        pinBtn.isBordered = false
-        let pinIcon = note.isPinned ? "pin.fill" : "pin"
-        let pinColor = note.isPinned ? NSColor.systemYellow : theme.icon
-        pinBtn.image = tintedSymbol(pinIcon, color: pinColor)
-        pinBtn.tag = row
-        pinBtn.target = self
-        pinBtn.action = #selector(pinNote(_:))
-        cell.addSubview(pinBtn)
+            // Pin button - on top of select button
+            let pinBtn = NSButton(frame: NSRect(x: cell.bounds.width - 55, y: 15, width: 20, height: 20))
+            pinBtn.autoresizingMask = [.minXMargin]
+            pinBtn.bezelStyle = .inline
+            pinBtn.isBordered = false
+            let pinIcon = note.isPinned ? "pin.fill" : "pin"
+            let pinColor = note.isPinned ? NSColor.systemYellow : theme.icon
+            pinBtn.image = tintedSymbol(pinIcon, color: pinColor)
+            pinBtn.tag = row
+            pinBtn.target = self
+            pinBtn.action = #selector(pinNote(_:))
+            cell.addSubview(pinBtn)
 
-        // Delete button - on top of everything, hidden if pinned
-        let deleteBtn = NSButton(frame: NSRect(x: cell.bounds.width - 30, y: 15, width: 20, height: 20))
-        deleteBtn.autoresizingMask = [.minXMargin]
-        deleteBtn.bezelStyle = .inline
-        deleteBtn.isBordered = false
-        deleteBtn.image = tintedSymbol("trash", color: theme.icon)
-        deleteBtn.tag = row
-        deleteBtn.target = self
-        deleteBtn.action = #selector(deleteNote(_:))
-        deleteBtn.isHidden = note.isPinned
-        cell.addSubview(deleteBtn)
+            // Delete button - on top of everything, hidden if pinned
+            let deleteBtn = NSButton(frame: NSRect(x: cell.bounds.width - 30, y: 15, width: 20, height: 20))
+            deleteBtn.autoresizingMask = [.minXMargin]
+            deleteBtn.bezelStyle = .inline
+            deleteBtn.isBordered = false
+            deleteBtn.image = tintedSymbol("trash", color: theme.icon)
+            deleteBtn.tag = row
+            deleteBtn.target = self
+            deleteBtn.action = #selector(deleteNote(_:))
+            deleteBtn.isHidden = note.isPinned
+            cell.addSubview(deleteBtn)
+        }
 
         return cell
     }
 
     @objc private func selectNote(_ sender: NSButton) {
         let row = sender.tag
-        if row >= 0 && row < notes.count {
-            onSelectNote?(notes[row])
+        guard row >= 0 && row < rows.count else { return }
+        if case .note(let note) = rows[row] {
+            onSelectNote?(note)
         }
     }
 
     @objc private func tableDoubleClick() {
         let row = tableView.clickedRow
-        guard row >= 0 && row < notes.count else { return }
-        onSelectNote?(notes[row])
+        guard row >= 0 && row < rows.count else { return }
+        if case .note(let note) = rows[row] {
+            onSelectNote?(note)
+        }
     }
 
     @objc private func deleteNote(_ sender: NSButton) {
         let row = sender.tag
-        if row >= 0 && row < notes.count {
-            onDeleteNote?(notes[row])
+        guard row >= 0 && row < rows.count else { return }
+        if case .note(let note) = rows[row] {
+            onDeleteNote?(note)
         }
     }
 
     @objc private func pinNote(_ sender: NSButton) {
         let row = sender.tag
-        if row >= 0 && row < notes.count {
-            onPinNote?(notes[row])
+        guard row >= 0 && row < rows.count else { return }
+        if case .note(let note) = rows[row] {
+            onPinNote?(note)
         }
+    }
+
+    @objc private func exitWorkspace() {
+        NotesManager.shared.setActiveWorkspace(nil)
+        performSearch()
+    }
+
+    @objc private func enterWorkspace(_ sender: NSButton) {
+        guard let workspaceName = sender.identifier?.rawValue else { return }
+        NotesManager.shared.setActiveWorkspace(workspaceName)
+        performSearch()
+    }
+
+    // MARK: - Mass Add to Workspace
+    @objc private func startAddingToWorkspace(_ sender: NSButton) {
+        guard let workspaceName = sender.identifier?.rawValue else { return }
+        isSelectingForWorkspace = true
+        targetWorkspace = workspaceName
+        selectedNoteIds.removeAll()
+        showSelectionBanner()
+        tableView.reloadData()
+    }
+
+    @objc private func toggleNoteSelection(_ sender: NSButton) {
+        let row = sender.tag
+        guard row >= 0 && row < rows.count else { return }
+        if case .note(let note) = rows[row] {
+            if selectedNoteIds.contains(note.id) {
+                selectedNoteIds.remove(note.id)
+            } else {
+                selectedNoteIds.insert(note.id)
+            }
+            tableView.reloadData(forRowIndexes: IndexSet(integer: row), columnIndexes: IndexSet(integer: 0))
+        }
+    }
+
+    private func showSelectionBanner() {
+        guard let workspace = targetWorkspace else { return }
+
+        // Remove existing banner if any
+        selectionBanner?.removeFromSuperview()
+
+        let bannerHeight: CGFloat = 40
+        let banner = NSView(frame: NSRect(x: 0, y: scrollView.frame.maxY, width: bounds.width, height: bannerHeight))
+        banner.autoresizingMask = [.width, .minYMargin]
+        banner.wantsLayer = true
+        banner.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.15).cgColor
+
+        let label = NSTextField(labelWithString: "Select notes to add to @\(workspace)")
+        label.font = .systemFont(ofSize: 13, weight: .medium)
+        label.textColor = ThemeManager.shared.currentTheme.text
+        label.frame = NSRect(x: 10, y: 10, width: bounds.width - 180, height: 20)
+        label.autoresizingMask = [.width]
+        label.isEditable = false
+        label.isSelectable = false
+        label.isBezeled = false
+        label.drawsBackground = false
+        banner.addSubview(label)
+
+        let doneBtn = NSButton(frame: NSRect(x: bounds.width - 95, y: 7, width: 60, height: 26))
+        doneBtn.autoresizingMask = [.minXMargin]
+        doneBtn.bezelStyle = .rounded
+        doneBtn.title = "Done"
+        doneBtn.target = self
+        doneBtn.action = #selector(finishAddingToWorkspace)
+        banner.addSubview(doneBtn)
+
+        let cancelBtn = NSButton(frame: NSRect(x: bounds.width - 165, y: 7, width: 60, height: 26))
+        cancelBtn.autoresizingMask = [.minXMargin]
+        cancelBtn.bezelStyle = .rounded
+        cancelBtn.title = "Cancel"
+        cancelBtn.target = self
+        cancelBtn.action = #selector(cancelAddingToWorkspace)
+        banner.addSubview(cancelBtn)
+
+        addSubview(banner)
+        selectionBanner = banner
+
+        // Adjust scroll view height
+        scrollView.frame.size.height = bounds.height - 40 - 36 - bannerHeight
+    }
+
+    private func hideSelectionBanner() {
+        selectionBanner?.removeFromSuperview()
+        selectionBanner = nil
+
+        // Restore scroll view height
+        let searchFieldY = searchField.frame.origin.y
+        scrollView.frame.size.height = searchFieldY - 8 - 36
+    }
+
+    @objc private func finishAddingToWorkspace() {
+        guard let workspace = targetWorkspace else { return }
+
+        // Add workspace to all selected notes
+        for noteId in selectedNoteIds {
+            NotesManager.shared.addWorkspace(to: noteId, workspace: workspace)
+        }
+
+        // Exit selection mode
+        isSelectingForWorkspace = false
+        targetWorkspace = nil
+        selectedNoteIds.removeAll()
+        hideSelectionBanner()
+
+        // Reload the view
+        performSearch()
+    }
+
+    @objc private func cancelAddingToWorkspace() {
+        isSelectingForWorkspace = false
+        targetWorkspace = nil
+        selectedNoteIds.removeAll()
+        hideSelectionBanner()
+        tableView.reloadData()
     }
 }
 
@@ -3632,24 +4767,52 @@ class HotkeyManager {
 
         // Use CGEvent to simulate Cmd+V - more reliable than AppleScript
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            // Check accessibility permission first
+            let trusted = AXIsProcessTrusted()
+            NSLog("FloatNote: Accessibility trusted: \(trusted)")
+
+            if !trusted {
+                NSLog("FloatNote: ERROR - Not trusted for accessibility. Please grant permission in System Settings → Privacy & Security → Accessibility")
+                // Show alert on main thread
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Accessibility Permission Required"
+                    alert.informativeText = "FloatMD needs Accessibility permission to inject text. Please add it in System Settings → Privacy & Security → Accessibility"
+                    alert.addButton(withTitle: "Open Settings")
+                    alert.addButton(withTitle: "Cancel")
+                    if alert.runModal() == .alertFirstButtonReturn {
+                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                    }
+                }
+                return
+            }
+
             NSLog("FloatNote: Simulating Cmd+V paste...")
 
             // Create key down event for 'v' with command modifier
-            let source = CGEventSource(stateID: .hidSystemState)
+            guard let source = CGEventSource(stateID: .hidSystemState) else {
+                NSLog("FloatNote: ERROR - Could not create CGEventSource")
+                return
+            }
 
             // Key code 9 = 'v'
-            if let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true) {
-                keyDown.flags = .maskCommand
-                keyDown.post(tap: .cghidEventTap)
+            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true) else {
+                NSLog("FloatNote: ERROR - Could not create keyDown event")
+                return
             }
+            keyDown.flags = .maskCommand
+            keyDown.post(tap: .cghidEventTap)
+            NSLog("FloatNote: keyDown posted")
 
             // Key up event
-            if let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false) {
-                keyUp.flags = .maskCommand
-                keyUp.post(tap: .cghidEventTap)
+            guard let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false) else {
+                NSLog("FloatNote: ERROR - Could not create keyUp event")
+                return
             }
+            keyUp.flags = .maskCommand
+            keyUp.post(tap: .cghidEventTap)
 
-            NSLog("FloatNote: Paste event posted")
+            NSLog("FloatNote: Paste event posted successfully")
         }
     }
 
