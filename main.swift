@@ -804,19 +804,33 @@ class DraggableTitleButton: NSButton {
     override var mouseDownCanMoveWindow: Bool { true }
 
     override func mouseDown(with event: NSEvent) {
-        // Record window position before drag
-        let windowOriginBefore = window?.frame.origin ?? .zero
+        let startingPoint = event.locationInWindow
 
-        // performDrag runs its own event loop and returns when drag ends
-        window?.performDrag(with: event)
-
-        // Check if window moved
-        let windowOriginAfter = window?.frame.origin ?? .zero
-        let distance = hypot(windowOriginAfter.x - windowOriginBefore.x, windowOriginAfter.y - windowOriginBefore.y)
-
-        // If window didn't move, it was a click - trigger action (open browser)
-        if distance < 3 {
-            target?.perform(action, with: self)
+        // Monitor events to decide between click and drag
+        // We capture the event stream to delay the decision
+        var keepOn = true
+        while keepOn {
+            guard let nextEvent = window?.nextEvent(matching: [.leftMouseUp, .leftMouseDragged]) else { continue }
+            
+            if nextEvent.type == .leftMouseUp {
+                // Mouse released without significant movement: It's a click!
+                if let action = action {
+                    NSApp.sendAction(action, to: target, from: self)
+                }
+                keepOn = false
+            } else if nextEvent.type == .leftMouseDragged {
+                let currentPoint = nextEvent.locationInWindow
+                let distance = hypot(currentPoint.x - startingPoint.x, currentPoint.y - startingPoint.y)
+                
+                // If moved enough, treat as drag start
+                if distance > 5 {
+                    // Hand off to system window dragging
+                    // We pass the ORIGINAL event to start the drag smoothly
+                    window?.performDrag(with: event)
+                    keepOn = false
+                }
+                // If distance <= 5, ignore small movement (jitter) and keep waiting
+            }
         }
     }
 }

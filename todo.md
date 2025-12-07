@@ -1,5 +1,5 @@
-- need ability to scroll on text window if it gets longer than window
-- if expand width text should expand to fill width (and get compact if window shrinks, fit width of window 
-- if portion of window highlighted the injection is just of highlighted part. 
-- second hot key combination that is cntl-X cont-C, deletes part from the text window. 
+- injection not working - is this the permission resetting issue? How can we sign to prevent need for this?
+
 - we drag from the title bar to move the window don't go to browser. 
+- bottom bar should not be visible in browser. 
+- move settings. 
