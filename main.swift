@@ -1143,7 +1143,7 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         let textStorage = NSTextStorage()
         let layoutManager = PillBackgroundLayoutManager()
         textStorage.addLayoutManager(layoutManager)
-        let textContainer = NSTextContainer(containerSize: NSSize(width: scrollView.contentSize.width, height: CGFloat.greatestFiniteMagnitude))
+        let textContainer = NSTextContainer(containerSize: NSSize(width: scrollView.contentSize.width - 30, height: CGFloat.greatestFiniteMagnitude))
         textContainer.widthTracksTextView = false
         textContainer.lineFragmentPadding = 0
         layoutManager.addTextContainer(textContainer)
@@ -1190,7 +1190,7 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         super.setFrameSize(newSize)
         // Update text container width to match the scroll view's content width
         if let textContainer = textView?.textContainer {
-            let newWidth = scrollView.contentSize.width
+            let newWidth = scrollView.contentSize.width - 30
             textContainer.containerSize = NSSize(width: newWidth, height: CGFloat.greatestFiniteMagnitude)
         }
         // Update workspace indicator for adaptive display
