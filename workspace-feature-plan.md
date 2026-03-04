@@ -1,4 +1,4 @@
-# FloatMD Workspaces Feature Plan
+# WispMark Workspaces Feature Plan
 
 ## Overview
 
@@ -261,14 +261,14 @@ In NoteBrowserView:
 - Line ~2200: `TagAutocompleteView` - extend or duplicate for workspaces
 - Line ~500: Theme colors (already has `workspaceTag` colors)
 
-**Windows (`FloatMD-Windows/`):**
+**Windows (`WispMark-Windows/`):**
 - `src/models/Note.ts` - add fields
 - `src/models/NotesManager.ts` - add workspace logic
 - `src/App.tsx` - layout for metadata bar
 - `src/components/NotesList.tsx` - workspace grouping
 - `src-tauri/src/storage.rs` - persistence
 
-**iOS (`FloatMD-iOS/`):**
+**iOS (`WispMark-iOS/`):**
 - `Models/Note.swift` - add fields
 - `Models/NotesManager.swift` - add workspace logic
 - Views for metadata bar and workspace navigation

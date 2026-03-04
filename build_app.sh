@@ -1,10 +1,38 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-APP_NAME="FloatMD"
+APP_NAME="WispMark"
 APP_DIR="$APP_NAME.app"
-BINARY_NAME="FloatMD"
-ICON_SOURCE="logo_float.png"
+BINARY_NAME="WispMark"
+ICON_SOURCE="logo_wispmark.png"
+APP_BUNDLE_ID="com.andybarenberg.WispMark"
+APP_VERSION="${WISPMARK_VERSION:-1.0.0}"
+BUILD_NUMBER="${WISPMARK_BUILD_NUMBER:-$(date +%Y%m%d%H%M%S)}"
+GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+INSTALL_PATH="/Applications/$APP_NAME.app"
+
+detect_sign_identity() {
+    if [ -n "${WISPMARK_SIGN_IDENTITY:-}" ]; then
+        echo "$WISPMARK_SIGN_IDENTITY"
+        return
+    fi
+
+    # Prefer a Developer ID Application identity if available.
+    local detected
+    detected="$(security find-identity -v -p codesigning 2>/dev/null | awk -F\" '/Developer ID Application/ {print $2; exit}')"
+    if [ -n "$detected" ]; then
+        echo "$detected"
+    else
+        echo "-"
+    fi
+}
+
+SIGN_IDENTITY="$(detect_sign_identity)"
+if [ "$SIGN_IDENTITY" = "-" ]; then
+    echo "Warning: No code-signing identity found. Falling back to ad-hoc signing."
+else
+    echo "Using signing identity: $SIGN_IDENTITY"
+fi
 
 echo "Cleaning up..."
 rm -rf "$APP_DIR"
@@ -25,9 +53,15 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
     <key>CFBundleExecutable</key>
     <string>$BINARY_NAME</string>
     <key>CFBundleIdentifier</key>
-    <string>com.andybarenberg.$APP_NAME</string>
+    <string>$APP_BUNDLE_ID</string>
     <key>CFBundleName</key>
     <string>$APP_NAME</string>
+    <key>CFBundleShortVersionString</key>
+    <string>$APP_VERSION</string>
+    <key>CFBundleVersion</key>
+    <string>$BUILD_NUMBER</string>
+    <key>WispMarkGitCommit</key>
+    <string>$GIT_COMMIT</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundlePackageType</key>
@@ -42,7 +76,7 @@ EOF
 
 if [ -f "$ICON_SOURCE" ]; then
     echo "Creating App Icon..."
-    ICONSET_DIR="FloatMD.iconset"
+    ICONSET_DIR="WispMark.iconset"
     mkdir -p "$ICONSET_DIR"
 
     # Resize images
@@ -66,41 +100,33 @@ else
     echo "Warning: $ICON_SOURCE not found. App will have generic icon."
 fi
 
-echo "Creating entitlements..."
-cat > "FloatMD.entitlements" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>com.apple.security.automation.apple-events</key>
-    <true/>
-</dict>
-</plist>
-EOF
+echo "Build metadata: version=$APP_VERSION build=$BUILD_NUMBER commit=$GIT_COMMIT"
 
-echo "Code signing app (ad-hoc)..."
-codesign --force --deep --sign - --entitlements FloatMD.entitlements "$APP_DIR"
+echo "Code signing app..."
+if [ "$SIGN_IDENTITY" = "-" ]; then
+    codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_DIR"
+else
+    codesign --force --deep --sign "$SIGN_IDENTITY" --options runtime --timestamp "$APP_DIR"
+fi
 
 echo "Build complete: $APP_DIR"
 
 echo "Installing to /Applications..."
-# Check if we should use a developer certificate
-SIGN_IDENTITY="${FLOATMD_SIGN_IDENTITY:--}"
-
-if [ "$SIGN_IDENTITY" != "-" ]; then
-    echo "Using signing identity: $SIGN_IDENTITY"
-fi
 
 # Remove existing app if present
-if [ -d "/Applications/$APP_NAME.app" ]; then
-    rm -rf "/Applications/$APP_NAME.app"
+if [ -d "$INSTALL_PATH" ]; then
+    rm -rf "$INSTALL_PATH"
 fi
 cp -R "$APP_DIR" "/Applications/"
 
-# Re-sign after copy
-codesign --force --deep --sign "$SIGN_IDENTITY" --entitlements FloatMD.entitlements "/Applications/$APP_NAME.app" 2>/dev/null || \
-codesign --force --deep --sign "$SIGN_IDENTITY" "/Applications/$APP_NAME.app"
+# Re-sign after copy to ensure final installed app has the expected signature.
+if [ "$SIGN_IDENTITY" = "-" ]; then
+    codesign --force --deep --sign "$SIGN_IDENTITY" "$INSTALL_PATH"
+else
+    codesign --force --deep --sign "$SIGN_IDENTITY" --options runtime --timestamp "$INSTALL_PATH"
+fi
 
-rm -f FloatMD.entitlements
+echo "Verifying signature..."
+codesign --verify --deep --strict --verbose=2 "$INSTALL_PATH"
 
-echo "Done! FloatMD has been installed to /Applications."
+echo "Done! WispMark has been installed to /Applications."

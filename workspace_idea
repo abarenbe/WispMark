@@ -1,0 +1,6 @@
+- define workspaces. maybe use @ symbol to define workspace. Can be in the form @workspace or @workspace/subworkspace. Can be "in workspace" where any files created are defaulted to being in that workspace. IF in a workspace: 
+- the @workspace/ is added to the front of the file name. 
+- browser default to showing workspace notes. (how can we find notes outside workspace while in a workspace?)
+- workspace shown as pill in title bar. 
+- ability to multi-select notes and add to workspace. 
+- when not in a workspace, all notes in a workspace are shown as collapsed in a the workspace line. 

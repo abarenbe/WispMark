@@ -1,25 +1,16 @@
-# FloatMD Help
+# WispMark Help
 
 ## Setup
 
-### Enable Text Injection
-To inject text into other apps using **Opt+Cmd+I**, you need to grant permissions:
+No extra system permissions are required for normal use.
 
-1. **Input Monitoring**: Go to System Settings > Privacy & Security > Input Monitoring and add Terminal (or the app running FloatMD)
-
-2. **Accessibility**: Go to System Settings > Privacy & Security > Accessibility and add Terminal (or the app running FloatMD)
-
-After adding permissions, restart FloatMD.
-
-## Using FloatMD
-
-### Text Injection
-Press **Opt+Cmd+I** anywhere to paste your current note's content into the focused app.
+## Using WispMark
 
 ### Notes Management
 - **+** button: Create a new blank note
 - **List** button: Browse all notes
 - **Pin** button: Pin a note to keep it at the top of the list
+- **Menu > Import Notes Folder...**: Import notes from another folder (useful when migrating installs)
 - Notes are auto-saved as you type
 - Empty notes are automatically deleted when you switch away
 - First line of text becomes the note title
@@ -46,7 +37,7 @@ Add tags to organize your notes:
 
 ### Markdown Formatting
 
-FloatMD renders markdown as you type. Syntax markers hide when your cursor moves away.
+WispMark renders markdown as you type. Syntax markers hide when your cursor moves away.
 
 #### Headings
 ```
@@ -98,7 +89,6 @@ Click checkboxes to toggle them.
 ## Keyboard Shortcuts
 | Action | Shortcut |
 |--------|----------|
-| Inject text | Opt+Cmd+I |
 | Indent list | Tab |
 | Outdent list | Shift+Tab |
 | Continue list | Enter |

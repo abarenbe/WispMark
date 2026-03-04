@@ -38,6 +38,17 @@ struct Note: Codable, Identifiable {
         self.tags = []
     }
 
+    // Full initializer for creating notes with specific values
+    init(id: UUID, content: String, createdAt: Date, modifiedAt: Date, isPinned: Bool, workspaces: Set<String>, tags: Set<String>) {
+        self.id = id
+        self.content = content
+        self.createdAt = createdAt
+        self.modifiedAt = modifiedAt
+        self.isPinned = isPinned
+        self.workspaces = workspaces
+        self.tags = tags
+    }
+
     // CodingKeys for backward compatibility
     enum CodingKeys: String, CodingKey {
         case id, content, createdAt, modifiedAt, isPinned, workspaces, tags
@@ -61,12 +72,43 @@ struct Note: Codable, Identifiable {
 // MARK: - Notes Manager
 class NotesManager {
     static let shared = NotesManager()
-    private let storageKey = "floatmd_notes"
+    private let legacyStorageKey = "floatmd_notes"
+    private let legacyDocumentsMigrationKey = "floatmd_documents_migrated_to_local"
+    private let legacyAppSupportMigrationKey = "wispmark_migrated_from_floatmd_app_support_notes"
     private let activeNoteKey = "floatmd_active_note"
     private let activeWorkspaceKey = "floatmd_active_workspace"
-
+    
+    // Local-only file storage (not in iCloud-synced Documents)
+    private let storageDirectory: URL
+    private let legacyAppSupportDirectory: URL
+    private let legacyDocumentsDirectory: URL
+    private let corruptedDirectory: URL
+    private let trashDirectory: URL
+    
     var notes: [Note] = []
-    var activeNoteId: UUID?
+    var notesDirectoryURL: URL { storageDirectory }
+    var corruptedNotesDirectoryURL: URL { corruptedDirectory }
+    var trashNotesDirectoryURL: URL { trashDirectory }
+    private var quarantinedCorruptedFiles: [String] = []
+    private struct MarkdownNoteMetadata: Codable {
+        let id: UUID
+        let createdAt: Date
+        let modifiedAt: Date
+        let isPinned: Bool
+        let workspaces: [String]
+        let tags: [String]
+    }
+    
+    var activeNoteId: UUID? {
+        didSet {
+            if let id = activeNoteId {
+                UserDefaults.standard.set(id.uuidString, forKey: activeNoteKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: activeNoteKey)
+            }
+        }
+    }
+    
     var activeWorkspace: String? {
         didSet {
             if let workspace = activeWorkspace {
@@ -82,60 +124,359 @@ class NotesManager {
         set {
             if let note = newValue, let index = notes.firstIndex(where: { $0.id == note.id }) {
                 notes[index] = note
-                save()
+                save(note: note)
             }
         }
     }
 
-    init() {
+    func noteFileURL(for noteID: UUID) -> URL {
+        let markdownURL = markdownFileURL(for: noteID)
+        if FileManager.default.fileExists(atPath: markdownURL.path) {
+            return markdownURL
+        }
+        let legacyURL = legacyJSONFileURL(for: noteID)
+        if FileManager.default.fileExists(atPath: legacyURL.path) {
+            return legacyURL
+        }
+        return markdownURL
+    }
+
+    @discardableResult
+    func importNotes(from folderURL: URL) -> (imported: Int, skipped: Int) {
+        let fileManager = FileManager.default
+        guard let files = try? fileManager.contentsOfDirectory(at: folderURL, includingPropertiesForKeys: nil) else {
+            return (0, 0)
+        }
+
+        var imported = 0
+        var skipped = 0
+
+        for fileURL in files {
+            let ext = fileURL.pathExtension.lowercased()
+            guard ext == "md" || ext == "json" else { continue }
+
+            let destinationURL = storageDirectory.appendingPathComponent(fileURL.lastPathComponent)
+            guard !fileManager.fileExists(atPath: destinationURL.path) else {
+                skipped += 1
+                continue
+            }
+
+            do {
+                try fileManager.copyItem(at: fileURL, to: destinationURL)
+                imported += 1
+            } catch {
+                NSLog("Error importing note %@: %@", fileURL.lastPathComponent, error.localizedDescription)
+                skipped += 1
+            }
+        }
+
         load()
+        if activeNoteId == nil {
+            activeNoteId = notes.first?.id
+        }
+
+        return (imported, skipped)
+    }
+
+    // Fixed UUID for the README note so we can identify it
+    private let readmeNoteId = UUID(uuidString: "00000000-0000-0000-0000-00000000000A")!
+
+    init() {
+        let fileManager = FileManager.default
+
+        // Store notes in local app support to avoid cross-device/iCloud sync conflicts.
+        let appSupportDirectory = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
+        storageDirectory = appSupportDirectory
+            .appendingPathComponent("WispMark", isDirectory: true)
+            .appendingPathComponent("Notes", isDirectory: true)
+        legacyAppSupportDirectory = appSupportDirectory
+            .appendingPathComponent("FloatMD", isDirectory: true)
+            .appendingPathComponent("Notes", isDirectory: true)
+        corruptedDirectory = appSupportDirectory
+            .appendingPathComponent("WispMark", isDirectory: true)
+            .appendingPathComponent("Corrupted", isDirectory: true)
+        trashDirectory = appSupportDirectory
+            .appendingPathComponent("WispMark", isDirectory: true)
+            .appendingPathComponent("Trash", isDirectory: true)
+
+        // Legacy location used before local-only storage.
+        let documentsDirectory = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Documents", isDirectory: true)
+        legacyDocumentsDirectory = documentsDirectory.appendingPathComponent("WispMark", isDirectory: true)
+
+        // Create directory if it doesn't exist
+        try? fileManager.createDirectory(at: storageDirectory, withIntermediateDirectories: true)
+        try? fileManager.createDirectory(at: corruptedDirectory, withIntermediateDirectories: true)
+        try? fileManager.createDirectory(at: trashDirectory, withIntermediateDirectories: true)
+
+        migrateFromLegacyAppSupportIfNeeded()
+        migrateFromLegacyDocumentsIfNeeded()
+
+        load()
+
+        // Migration check
+        if notes.isEmpty && UserDefaults.standard.data(forKey: legacyStorageKey) != nil {
+            migrateFromUserDefaults()
+        }
+
+        // Ensure README note exists
+        ensureReadmeNote()
+
         if notes.isEmpty {
             let newNote = Note(content: "")
             notes.append(newNote)
             activeNoteId = newNote.id
-            save()
+            save(note: newNote)
         }
-        if activeNoteId == nil {
+
+        // Restore active note
+        if let idString = UserDefaults.standard.string(forKey: activeNoteKey),
+           let id = UUID(uuidString: idString),
+           notes.contains(where: { $0.id == id }) {
+            activeNoteId = id
+        } else {
             activeNoteId = notes.first?.id
         }
+
         // Restore active workspace
         activeWorkspace = UserDefaults.standard.string(forKey: activeWorkspaceKey)
+    }
+
+    private func ensureReadmeNote() {
+        // Check if README note already exists
+        if notes.contains(where: { $0.id == readmeNoteId }) {
+            return
+        }
+
+        let readmeContent = """
+# WispMark Guide
+
+Welcome to WispMark - your floating markdown notes app!
+
+## Quick Start
+- **Cmd+N** - Create new note
+- **Ctrl+Cmd+Opt+/** - Toggle window visibility
+- Click the title bar to see all notes
+
+## Tags with #
+Type `#tagname` anywhere in your note to add a tag.
+- Tags appear in the metadata bar below the title
+- Click a tag to filter notes by that tag
+- Example: #work #ideas #todo
+
+## Workspaces with @
+Type `@workspace` to organize notes into workspaces.
+- Workspaces create a hierarchy (like folders)
+- Use `/` for nested workspaces: @work/projects
+- Click workspace pills to navigate
+- The "." workspace means "show in home view"
+
+## Note Links with [[
+Type `[[` to link to another note.
+- Start typing to search notes
+- Links are clickable to jump between notes
+- Great for building a personal wiki
+
+## Formatting
+WispMark supports Markdown:
+- **bold** with `**text**`
+- *italic* with `*text*`
+- `code` with backticks
+- # Headings with `#`
+
+## Tips
+- Pin important notes (they can't be deleted)
+- Notes auto-save as you type
+- Notes stored locally as .md files in ~/Library/Application Support/WispMark/Notes/
+- Deleted notes can be restored from the app menu
+
+---
+*This note is pinned and cannot be deleted.*
+"""
+
+        let readmeNote = Note(
+            id: readmeNoteId,
+            content: readmeContent,
+            createdAt: Date(),
+            modifiedAt: Date(),
+            isPinned: true,
+            workspaces: [],
+            tags: ["help"]
+        )
+
+        notes.append(readmeNote)
+        save(note: readmeNote)
+    }
+
+    private func migrateFromUserDefaults() {
+        guard let data = UserDefaults.standard.data(forKey: legacyStorageKey),
+              let legacyNotes = try? JSONDecoder().decode([Note].self, from: data) else { return }
+        
+        for note in legacyNotes {
+            notes.append(note)
+            save(note: note)
+        }
+        
+        // Clear legacy data after successful migration
+        UserDefaults.standard.removeObject(forKey: legacyStorageKey)
+    }
+
+    private func migrateFromLegacyAppSupportIfNeeded() {
+        let fileManager = FileManager.default
+        let defaults = UserDefaults.standard
+        if defaults.bool(forKey: legacyAppSupportMigrationKey) { return }
+
+        guard let legacyFiles = try? fileManager.contentsOfDirectory(at: legacyAppSupportDirectory, includingPropertiesForKeys: nil) else {
+            defaults.set(true, forKey: legacyAppSupportMigrationKey)
+            return
+        }
+
+        for legacyFile in legacyFiles {
+            let ext = legacyFile.pathExtension.lowercased()
+            guard ext == "md" || ext == "json" else { continue }
+            let destinationURL = storageDirectory.appendingPathComponent(legacyFile.lastPathComponent)
+            guard !fileManager.fileExists(atPath: destinationURL.path) else { continue }
+            do {
+                try fileManager.copyItem(at: legacyFile, to: destinationURL)
+            } catch {
+                NSLog("Error migrating legacy app support note %@: %@", legacyFile.lastPathComponent, error.localizedDescription)
+            }
+        }
+
+        defaults.set(true, forKey: legacyAppSupportMigrationKey)
+    }
+
+    private func migrateFromLegacyDocumentsIfNeeded() {
+        let fileManager = FileManager.default
+        let defaults = UserDefaults.standard
+        if defaults.bool(forKey: legacyDocumentsMigrationKey) { return }
+
+        guard let existingFiles = try? fileManager.contentsOfDirectory(at: storageDirectory, includingPropertiesForKeys: nil) else { return }
+        let readmeBasename = readmeNoteId.uuidString
+        let hasCurrentUserNotes = existingFiles.contains { file in
+            let ext = file.pathExtension.lowercased()
+            return (ext == "md" || ext == "json") && file.deletingPathExtension().lastPathComponent != readmeBasename
+        }
+        if hasCurrentUserNotes {
+            defaults.set(true, forKey: legacyDocumentsMigrationKey)
+            return
+        }
+
+        guard let legacyFiles = try? fileManager.contentsOfDirectory(at: legacyDocumentsDirectory, includingPropertiesForKeys: nil) else {
+            defaults.set(true, forKey: legacyDocumentsMigrationKey)
+            return
+        }
+
+        for legacyFile in legacyFiles {
+            let ext = legacyFile.pathExtension.lowercased()
+            guard ext == "md" || ext == "json" else { continue }
+            let destinationURL = storageDirectory.appendingPathComponent(legacyFile.lastPathComponent)
+            guard !fileManager.fileExists(atPath: destinationURL.path) else { continue }
+            do {
+                try fileManager.copyItem(at: legacyFile, to: destinationURL)
+            } catch {
+                NSLog("Error migrating legacy note %@: %@", legacyFile.lastPathComponent, error.localizedDescription)
+            }
+        }
+
+        defaults.set(true, forKey: legacyDocumentsMigrationKey)
     }
 
     func createNote() -> Note {
         let note = Note(content: "")
         notes.insert(note, at: 0)
         activeNoteId = note.id
-        save()
+        save(note: note)
         return note
     }
 
     func deleteNote(_ note: Note) {
         // Pinned notes cannot be deleted
         guard !note.isPinned else { return }
+
+        // Soft-delete file by moving it to local trash.
+        let fileManager = FileManager.default
+        let markdownURL = markdownFileURL(for: note.id)
+        let legacyJSONURL = legacyJSONFileURL(for: note.id)
+        let sourceURL: URL? = fileManager.fileExists(atPath: markdownURL.path) ? markdownURL :
+            (fileManager.fileExists(atPath: legacyJSONURL.path) ? legacyJSONURL : nil)
+
+        if let fileURL = sourceURL {
+            let trashURL = makeTrashURL(for: note, pathExtension: fileURL.pathExtension)
+            do {
+                try fileManager.moveItem(at: fileURL, to: trashURL)
+            } catch {
+                NSLog("Error moving note to trash: %@", error.localizedDescription)
+                // Fallback so deletion still succeeds if trash move fails.
+                try? fileManager.removeItem(at: fileURL)
+            }
+        }
+
         notes.removeAll { $0.id == note.id }
         if activeNoteId == note.id {
             activeNoteId = notes.first?.id
         }
-        save()
+    }
+
+    func hasDeletedNotesInTrash() -> Bool {
+        guard let files = try? FileManager.default.contentsOfDirectory(at: trashDirectory, includingPropertiesForKeys: nil) else { return false }
+        return files.contains {
+            let ext = $0.pathExtension.lowercased()
+            return ext == "md" || ext == "json"
+        }
+    }
+
+    func restoreMostRecentlyDeletedNote() -> Note? {
+        let fileManager = FileManager.default
+        let trashFiles = sortedTrashFiles()
+
+        for fileURL in trashFiles {
+            do {
+                var note = try decodeNoteFromFile(fileURL)
+
+                if notes.contains(where: { $0.id == note.id }) {
+                    note = Note(
+                        id: UUID(),
+                        content: note.content,
+                        createdAt: note.createdAt,
+                        modifiedAt: Date(),
+                        isPinned: note.isPinned,
+                        workspaces: note.workspaces,
+                        tags: note.tags
+                    )
+                } else {
+                    note.modifiedAt = Date()
+                }
+
+                notes.insert(note, at: 0)
+                activeNoteId = note.id
+                save(note: note)
+                try fileManager.removeItem(at: fileURL)
+                return note
+            } catch {
+                NSLog("Error restoring deleted note %@: %@", fileURL.lastPathComponent, error.localizedDescription)
+            }
+        }
+
+        return nil
     }
 
     func togglePin(_ note: Note) {
         guard let index = notes.firstIndex(where: { $0.id == note.id }) else { return }
         notes[index].isPinned.toggle()
-        save()
+        save(note: notes[index])
     }
-
+    
     func updateActiveNote(content: String) {
         guard let id = activeNoteId, let index = notes.firstIndex(where: { $0.id == id }) else { return }
         notes[index].content = content
         notes[index].modifiedAt = Date()
-        save()
+        save(note: notes[index])
     }
 
     func setActiveNote(_ note: Note) {
         activeNoteId = note.id
-        UserDefaults.standard.set(note.id.uuidString, forKey: activeNoteKey)
     }
 
     func searchNotes(_ query: String) -> [Note] {
@@ -153,7 +494,7 @@ class NotesManager {
         // Create new note with title as first line
         let note = Note(content: "# \(title)\n\n")
         notes.insert(note, at: 0)
-        save()
+        save(note: note)
         return note
     }
 
@@ -164,14 +505,9 @@ class NotesManager {
 
     func getAllTags() -> [String] {
         var tags = Set<String>()
-        let tagPattern = try! NSRegularExpression(pattern: "#([a-zA-Z][a-zA-Z0-9_-]*)", options: [])
         for note in notes {
-            let range = NSRange(location: 0, length: note.content.utf16.count)
-            let matches = tagPattern.matches(in: note.content, options: [], range: range)
-            for match in matches {
-                if let tagRange = Range(match.range(at: 1), in: note.content) {
-                    tags.insert(String(note.content[tagRange]))
-                }
+            for tag in note.tags {
+                tags.insert(tag)
             }
         }
         return tags.sorted()
@@ -181,7 +517,7 @@ class NotesManager {
         var results = notes
         // Filter by tags first
         for tag in tags {
-            results = results.filter { $0.content.contains("#\(tag)") }
+            results = results.filter { $0.tags.contains(tag) }
         }
         // Then filter by text query
         if !query.isEmpty {
@@ -190,7 +526,7 @@ class NotesManager {
         }
         return results
     }
-
+    
     func getAllNoteTitles() -> [String] {
         return notes.map { $0.title }.filter { $0 != "Untitled" }
     }
@@ -210,9 +546,12 @@ class NotesManager {
         guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return }
         for i in 0..<notes.count {
             let range = NSRange(location: 0, length: notes[i].content.utf16.count)
-            notes[i].content = regex.stringByReplacingMatches(in: notes[i].content, options: [], range: range, withTemplate: "[[\(newTitle)]]")
+            let newContent = regex.stringByReplacingMatches(in: notes[i].content, options: [], range: range, withTemplate: "[[\(newTitle)]]")
+            if notes[i].content != newContent {
+                notes[i].content = newContent
+                save(note: notes[i])
+            }
         }
-        save()
     }
 
     // MARK: - Workspace Methods
@@ -256,76 +595,264 @@ class NotesManager {
         guard let index = notes.firstIndex(where: { $0.id == noteId }) else { return }
         notes[index].workspaces.insert(workspace)
         notes[index].modifiedAt = Date()
-        save()
+        save(note: notes[index])
     }
 
     func removeWorkspace(from noteId: UUID, workspace: String) {
         guard let index = notes.firstIndex(where: { $0.id == noteId }) else { return }
         notes[index].workspaces.remove(workspace)
         notes[index].modifiedAt = Date()
-        save()
+        save(note: notes[index])
     }
 
     func addTag(to noteId: UUID, tag: String) {
         guard let index = notes.firstIndex(where: { $0.id == noteId }) else { return }
         notes[index].tags.insert(tag)
         notes[index].modifiedAt = Date()
-        save()
+        save(note: notes[index])
     }
 
     func removeTag(from noteId: UUID, tag: String) {
         guard let index = notes.firstIndex(where: { $0.id == noteId }) else { return }
         notes[index].tags.remove(tag)
         notes[index].modifiedAt = Date()
-        save()
+        save(note: notes[index])
     }
 
-    private func save() {
-        if let data = try? JSONEncoder().encode(notes) {
-            UserDefaults.standard.set(data, forKey: storageKey)
+    func takeCorruptedFileReport() -> [String] {
+        let report = quarantinedCorruptedFiles
+        quarantinedCorruptedFiles = []
+        return report
+    }
+
+    private func markdownFileURL(for noteID: UUID) -> URL {
+        storageDirectory.appendingPathComponent("\(noteID.uuidString).md")
+    }
+
+    private func legacyJSONFileURL(for noteID: UUID) -> URL {
+        storageDirectory.appendingPathComponent("\(noteID.uuidString).json")
+    }
+
+    private func isNoteFile(_ file: URL) -> Bool {
+        let ext = file.pathExtension.lowercased()
+        return ext == "md" || ext == "json"
+    }
+
+    private func noteIDFromFileName(_ fileURL: URL) -> UUID? {
+        let stem = fileURL.deletingPathExtension().lastPathComponent
+        if let id = UUID(uuidString: stem) { return id }
+        if stem.count >= 36 {
+            let prefix = String(stem.prefix(36))
+            if let id = UUID(uuidString: prefix) { return id }
         }
-        if let id = activeNoteId {
-            UserDefaults.standard.set(id.uuidString, forKey: activeNoteKey)
+        return nil
+    }
+
+    private func fileModifiedDate(_ fileURL: URL) -> Date {
+        (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationDate] as? Date) ?? Date()
+    }
+
+    private func markdownString(for note: Note) throws -> String {
+        let metadata = MarkdownNoteMetadata(
+            id: note.id,
+            createdAt: note.createdAt,
+            modifiedAt: note.modifiedAt,
+            isPinned: note.isPinned,
+            workspaces: note.workspaces.sorted(),
+            tags: note.tags.sorted()
+        )
+        let metadataData = try JSONEncoder().encode(metadata)
+        guard let metadataJSON = String(data: metadataData, encoding: .utf8) else {
+            throw NSError(domain: "WispMark", code: 1001, userInfo: [NSLocalizedDescriptionKey: "Failed to encode markdown metadata"])
+        }
+        return "---\nfloatmd_meta: \(metadataJSON)\n---\n\(note.content)"
+    }
+
+    private func parseFrontMatter(from markdown: String) -> (metadataJSON: String, content: String)? {
+        guard markdown.hasPrefix("---\n") else { return nil }
+        let frontMatterStart = markdown.index(markdown.startIndex, offsetBy: 4)
+        guard let closeRange = markdown.range(of: "\n---\n", range: frontMatterStart..<markdown.endIndex) else { return nil }
+
+        let frontMatter = String(markdown[frontMatterStart..<closeRange.lowerBound])
+        let content = String(markdown[closeRange.upperBound...])
+        let prefix = "floatmd_meta:"
+        guard let metaLine = frontMatter.split(separator: "\n", omittingEmptySubsequences: false).first(where: {
+            $0.trimmingCharacters(in: .whitespaces).hasPrefix(prefix)
+        }) else { return nil }
+
+        let trimmed = String(metaLine).trimmingCharacters(in: .whitespaces)
+        let jsonPart = String(trimmed.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+        guard !jsonPart.isEmpty else { return nil }
+        return (jsonPart, content)
+    }
+
+    private func decodeMarkdownNote(from fileURL: URL) throws -> Note {
+        let data = try Data(contentsOf: fileURL)
+        let markdown = String(decoding: data, as: UTF8.self)
+        let fallbackId = noteIDFromFileName(fileURL) ?? UUID()
+        let fallbackDate = fileModifiedDate(fileURL)
+
+        if let frontMatter = parseFrontMatter(from: markdown),
+           let metadataData = frontMatter.metadataJSON.data(using: .utf8),
+           let metadata = try? JSONDecoder().decode(MarkdownNoteMetadata.self, from: metadataData) {
+            return Note(
+                id: metadata.id,
+                content: frontMatter.content,
+                createdAt: metadata.createdAt,
+                modifiedAt: metadata.modifiedAt,
+                isPinned: metadata.isPinned,
+                workspaces: Set(metadata.workspaces),
+                tags: Set(metadata.tags)
+            )
+        }
+
+        // Plain markdown fallback: keep content and derive metadata from file context.
+        return Note(
+            id: fallbackId,
+            content: markdown,
+            createdAt: fallbackDate,
+            modifiedAt: fallbackDate,
+            isPinned: false,
+            workspaces: [],
+            tags: []
+        )
+    }
+
+    private func decodeJSONNote(from fileURL: URL) throws -> Note {
+        let data = try Data(contentsOf: fileURL)
+        return try JSONDecoder().decode(Note.self, from: data)
+    }
+
+    private func decodeNoteFromFile(_ fileURL: URL) throws -> Note {
+        switch fileURL.pathExtension.lowercased() {
+        case "md":
+            return try decodeMarkdownNote(from: fileURL)
+        case "json":
+            return try decodeJSONNote(from: fileURL)
+        default:
+            throw NSError(domain: "WispMark", code: 1002, userInfo: [NSLocalizedDescriptionKey: "Unsupported note extension"])
+        }
+    }
+
+    private func migrateTagsIfNeeded(_ note: inout Note) -> Bool {
+        if !note.tags.isEmpty { return false }
+        let tagPattern = try! NSRegularExpression(pattern: "#([a-zA-Z][a-zA-Z0-9_-]*)", options: [])
+        let range = NSRange(location: 0, length: note.content.utf16.count)
+        guard tagPattern.firstMatch(in: note.content, options: [], range: range) != nil else { return false }
+        let matches = tagPattern.matches(in: note.content, options: [], range: range)
+        for match in matches {
+            if let tagRange = Range(match.range(at: 1), in: note.content) {
+                let tag = String(note.content[tagRange])
+                note.tags.insert(tag)
+            }
+        }
+        return true
+    }
+
+    private func migrateJSONFileToMarkdownIfNeeded(_ fileURL: URL, note: Note) {
+        guard fileURL.pathExtension.lowercased() == "json" else { return }
+        let fileManager = FileManager.default
+        let markdownURL = markdownFileURL(for: note.id)
+
+        if fileManager.fileExists(atPath: markdownURL.path) {
+            try? fileManager.removeItem(at: fileURL)
+            return
+        }
+
+        do {
+            let markdown = try markdownString(for: note)
+            try markdown.write(to: markdownURL, atomically: true, encoding: .utf8)
+            try? fileManager.removeItem(at: fileURL)
+        } catch {
+            NSLog("Error migrating JSON note %@ to markdown: %@", fileURL.lastPathComponent, error.localizedDescription)
+        }
+    }
+
+    private func save(note: Note) {
+        let fileURL = markdownFileURL(for: note.id)
+        do {
+            let markdown = try markdownString(for: note)
+            try markdown.write(to: fileURL, atomically: true, encoding: .utf8)
+            let legacyJSONURL = legacyJSONFileURL(for: note.id)
+            if FileManager.default.fileExists(atPath: legacyJSONURL.path) {
+                try? FileManager.default.removeItem(at: legacyJSONURL)
+            }
+        } catch {
+            NSLog("Error saving note: %@", error.localizedDescription)
         }
     }
 
     private func load() {
-        if let data = UserDefaults.standard.data(forKey: storageKey),
-           let decoded = try? JSONDecoder().decode([Note].self, from: data) {
-            notes = decoded.sorted { $0.modifiedAt > $1.modifiedAt }
+        notes = []
+        quarantinedCorruptedFiles = []
+        guard let files = try? FileManager.default.contentsOfDirectory(at: storageDirectory, includingPropertiesForKeys: nil) else { return }
 
-            // Migration: Parse tags from content for notes that have empty tags field
-            migrateTags()
-        }
-        if let idString = UserDefaults.standard.string(forKey: activeNoteKey),
-           let id = UUID(uuidString: idString) {
-            activeNoteId = id
-        }
-    }
+        var notesById: [UUID: Note] = [:]
 
-    private func migrateTags() {
-        // Parse #tags from content and populate tags field for migration
-        let tagPattern = try! NSRegularExpression(pattern: "#([a-zA-Z][a-zA-Z0-9_-]*)", options: [])
-        var needsSave = false
-
-        for i in 0..<notes.count {
-            // Only migrate if tags field is empty (backward compatibility)
-            if notes[i].tags.isEmpty {
-                let range = NSRange(location: 0, length: notes[i].content.utf16.count)
-                let matches = tagPattern.matches(in: notes[i].content, options: [], range: range)
-
-                for match in matches {
-                    if let tagRange = Range(match.range(at: 1), in: notes[i].content) {
-                        let tag = String(notes[i].content[tagRange])
-                        notes[i].tags.insert(tag)
-                        needsSave = true
-                    }
+        for file in files where isNoteFile(file) {
+            do {
+                var note = try decodeNoteFromFile(file)
+                if migrateTagsIfNeeded(&note) {
+                    save(note: note)
                 }
+
+                if let existing = notesById[note.id] {
+                    if note.modifiedAt >= existing.modifiedAt {
+                        notesById[note.id] = note
+                    }
+                } else {
+                    notesById[note.id] = note
+                }
+
+                migrateJSONFileToMarkdownIfNeeded(file, note: note)
+            } catch {
+                quarantineCorruptedNoteFile(file, error: error)
             }
         }
 
-        if needsSave {
-            save()
+        notes = Array(notesById.values)
+        notes.sort { $0.modifiedAt > $1.modifiedAt }
+    }
+
+    private func quarantineCorruptedNoteFile(_ file: URL, error readError: Error) {
+        let fileManager = FileManager.default
+        let ext = file.pathExtension.lowercased()
+        let safeExt = ext.isEmpty ? "md" : ext
+        var destinationURL = corruptedDirectory.appendingPathComponent(file.lastPathComponent)
+
+        if fileManager.fileExists(atPath: destinationURL.path) {
+            let base = file.deletingPathExtension().lastPathComponent
+            let timestamp = String(Int(Date().timeIntervalSince1970))
+            destinationURL = corruptedDirectory.appendingPathComponent("\(base)-\(timestamp).\(safeExt)")
+        }
+
+        do {
+            try fileManager.moveItem(at: file, to: destinationURL)
+            quarantinedCorruptedFiles.append(destinationURL.lastPathComponent)
+            NSLog("Moved unreadable note %@ to %@", file.lastPathComponent, destinationURL.path)
+        } catch {
+            NSLog("Error moving unreadable note %@: %@", file.lastPathComponent, error.localizedDescription)
+            NSLog("Original decode/read error for %@: %@", file.lastPathComponent, String(describing: readError))
+        }
+    }
+
+    private func makeTrashURL(for note: Note, pathExtension: String = "md") -> URL {
+        let timestamp = String(Int(Date().timeIntervalSince1970))
+        let ext = pathExtension.isEmpty ? "md" : pathExtension.lowercased()
+        return trashDirectory.appendingPathComponent("\(note.id.uuidString)-\(timestamp).\(ext)")
+    }
+
+    private func sortedTrashFiles() -> [URL] {
+        let fileManager = FileManager.default
+        guard let files = try? fileManager.contentsOfDirectory(at: trashDirectory, includingPropertiesForKeys: nil) else { return [] }
+        let noteFiles = files.filter { file in
+            let ext = file.pathExtension.lowercased()
+            return ext == "md" || ext == "json"
+        }
+        return noteFiles.sorted {
+            let lhsDate = (try? fileManager.attributesOfItem(atPath: $0.path)[.modificationDate] as? Date) ?? .distantPast
+            let rhsDate = (try? fileManager.attributesOfItem(atPath: $1.path)[.modificationDate] as? Date) ?? .distantPast
+            return lhsDate > rhsDate
         }
     }
 }
@@ -346,7 +873,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         window.center()
-        window.setFrameAutosaveName("FloatNoteWindow")
+        window.setFrameAutosaveName("WispMarkWindow")
         window.level = .floating
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.isFloatingPanel = true
@@ -361,14 +888,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            // Load AppIcon from bundle and resize for menu bar
-            if let appIcon = NSImage(named: "AppIcon") {
+            // Prefer an asset icon if available; otherwise fall back to the bundled icns app icon.
+            if let appIcon = NSImage(named: "AppIcon")
+                ?? Bundle.main.path(forResource: "StoreAppIcon", ofType: "icns").flatMap({ NSImage(contentsOfFile: $0) }) {
                 appIcon.size = NSSize(width: 18, height: 18)
                 appIcon.isTemplate = true  // Adapts to light/dark menu bar
                 button.image = appIcon
             } else {
                 // Fallback to SF Symbol if AppIcon not found
-                button.image = NSImage(systemSymbolName: "doc.text", accessibilityDescription: "FloatNote")
+                button.image = NSImage(systemSymbolName: "doc.text", accessibilityDescription: "WispMark")
             }
         }
 
@@ -396,19 +924,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(editMenuItem)
 
         HotkeyManager.shared.register()
-        checkAccessibilityPermissions()
+        showCorruptedNoteRecoveryAlertIfNeeded()
     }
 
-    func checkAccessibilityPermissions() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
-        let accessEnabled = AXIsProcessTrustedWithOptions(options as CFDictionary)
-        if !accessEnabled {
-            let alert = NSAlert()
-            alert.messageText = "Accessibility Permissions Needed"
-            alert.informativeText = "To inject text into other apps, FloatNote needs Accessibility permissions."
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
+    private func showCorruptedNoteRecoveryAlertIfNeeded() {
+        let recoveredFiles = NotesManager.shared.takeCorruptedFileReport()
+        guard !recoveredFiles.isEmpty else { return }
+
+        let previewList = recoveredFiles.prefix(8).joined(separator: "\n")
+        let remainingCount = max(0, recoveredFiles.count - 8)
+
+        var details = "WispMark found \(recoveredFiles.count) unreadable note file(s) and moved them to:\n\(NotesManager.shared.corruptedNotesDirectoryURL.path)"
+        if !previewList.isEmpty {
+            details += "\n\nRecovered file names:\n\(previewList)"
         }
+        if remainingCount > 0 {
+            details += "\n...and \(remainingCount) more."
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Recovered Unreadable Notes"
+        alert.informativeText = details
+        alert.addButton(withTitle: "OK")
+        alert.alertStyle = .warning
+        alert.runModal()
     }
 
     @objc func createNewNote() {
@@ -418,6 +957,63 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func restoreLastDeletedNote() {
+        guard let _ = NotesManager.shared.restoreMostRecentlyDeletedNote() else {
+            let alert = NSAlert()
+            alert.messageText = "Nothing to Restore"
+            alert.informativeText = "There are no recently deleted notes available."
+            alert.addButton(withTitle: "OK")
+            alert.alertStyle = .informational
+            alert.runModal()
+            return
+        }
+
+        if let mainView = window.contentView as? MainView {
+            mainView.loadActiveNote()
+        }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func copyActiveNoteFilePath() {
+        guard let activeNote = NotesManager.shared.activeNote else { return }
+        let fileURL = NotesManager.shared.noteFileURL(for: activeNote.id)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(fileURL.path, forType: .string)
+    }
+
+    @objc func importNotesFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "Import"
+
+        guard panel.runModal() == .OK, let selectedFolder = panel.url else { return }
+
+        let didStartAccess = selectedFolder.startAccessingSecurityScopedResource()
+        defer {
+            if didStartAccess {
+                selectedFolder.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        let result = NotesManager.shared.importNotes(from: selectedFolder)
+
+        if let mainView = window.contentView as? MainView {
+            mainView.loadActiveNote()
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Import Complete"
+        alert.informativeText = "Imported \(result.imported) note(s). Skipped \(result.skipped) existing or unreadable file(s)."
+        alert.addButton(withTitle: "OK")
+        alert.alertStyle = .informational
+        alert.runModal()
     }
 
     @objc func selectNote(_ sender: NSMenuItem) {
@@ -435,6 +1031,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
+
+    private func appVersionLabel() -> String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "dev"
+        let build = info?["CFBundleVersion"] as? String ?? "0"
+        let commit = (info?["WispMarkGitCommit"] as? String) ?? (info?["FloatMDGitCommit"] as? String) ?? "unknown"
+        return "Version \(version) (\(build), \(commit))"
+    }
 }
 
 extension AppDelegate: NSMenuDelegate {
@@ -451,6 +1055,20 @@ extension AppDelegate: NSMenuDelegate {
         let newNoteItem = NSMenuItem(title: "New Note", action: #selector(createNewNote), keyEquivalent: "n")
         newNoteItem.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)
         menu.addItem(newNoteItem)
+
+        let restoreItem = NSMenuItem(title: "Restore Last Deleted Note", action: #selector(restoreLastDeletedNote), keyEquivalent: "")
+        restoreItem.image = NSImage(systemSymbolName: "arrow.uturn.left.circle", accessibilityDescription: nil)
+        restoreItem.isEnabled = NotesManager.shared.hasDeletedNotesInTrash()
+        menu.addItem(restoreItem)
+
+        let copyPathItem = NSMenuItem(title: "Copy Active Note File Path", action: #selector(copyActiveNoteFilePath), keyEquivalent: "")
+        copyPathItem.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
+        copyPathItem.isEnabled = NotesManager.shared.activeNote != nil
+        menu.addItem(copyPathItem)
+
+        let importItem = NSMenuItem(title: "Import Notes Folder...", action: #selector(importNotesFolder), keyEquivalent: "")
+        importItem.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: nil)
+        menu.addItem(importItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -529,7 +1147,7 @@ extension AppDelegate: NSMenuDelegate {
 
         // Quit
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit FloatNote", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Quit WispMark", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -544,9 +1162,10 @@ extension AppDelegate: NSMenuDelegate {
     private func rebuildMenuItems() {
         guard let menu = statusItem.menu else { return }
 
-        // Remove all items except New Note (first) and separator (second) and search field (third)
-        while menu.items.count > 3 {
-            menu.removeItem(at: 3)
+        // Keep static header items:
+        // 0 New Note, 1 Restore, 2 Copy Path, 3 Import, 4 separator, 5 search field.
+        while menu.items.count > 6 {
+            menu.removeItem(at: 6)
         }
 
         menu.addItem(NSMenuItem.separator())
@@ -606,7 +1225,11 @@ extension AppDelegate: NSMenuDelegate {
 
         // Quit
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit FloatNote", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        let versionItem = NSMenuItem(title: appVersionLabel(), action: nil, keyEquivalent: "")
+        versionItem.isEnabled = false
+        menu.addItem(versionItem)
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Quit WispMark", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 }
 
@@ -838,6 +1461,10 @@ class DraggableTitleButton: NSButton {
 // MARK: - Clickable Text View
 // MARK: - Pill Background Layout Manager
 class PillBackgroundLayoutManager: NSLayoutManager {
+    var codeBlockXOffset: CGFloat = 0
+    var codeBlockHorizontalInset: CGFloat = 0
+    var codeBlockYOffset: CGFloat = 0
+
     override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
         super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
 
@@ -856,6 +1483,41 @@ class PillBackgroundLayoutManager: NSLayoutManager {
                 let path = NSBezierPath(roundedRect: pillRect, xRadius: 4, yRadius: 4)
                 color.setFill()
                 path.fill()
+            }
+        }
+
+        textStorage.enumerateAttribute(.init("codeBlockBackground"), in: charRange, options: []) { value, range, _ in
+            guard value != nil else { return }
+
+            let glyphRange = self.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            guard glyphRange.location != NSNotFound,
+                  glyphRange.length > 0,
+                  let container = self.textContainer(forGlyphAt: glyphRange.location, effectiveRange: nil) else { return }
+
+            var unionRect = NSRect.null
+            self.enumerateEnclosingRects(
+                forGlyphRange: glyphRange,
+                withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
+                in: container
+            ) { rect, _ in
+                unionRect = unionRect.isNull ? rect : unionRect.union(rect)
+            }
+
+            guard !unionRect.isNull else { return }
+
+            // Force full-width block cards so fenced code reads as a real rounded box.
+            var blockRect = unionRect
+            blockRect.origin.x = 0
+            blockRect.size.width = container.size.width
+            let boxRect = blockRect
+                .offsetBy(dx: origin.x + codeBlockXOffset, dy: origin.y)
+                .insetBy(dx: codeBlockHorizontalInset, dy: 0)
+            let path = NSBezierPath(roundedRect: boxRect, xRadius: 10, yRadius: 10)
+
+            if let borderColor = textStorage.attribute(.init("codeBlockBorderColor"), at: range.location, effectiveRange: nil) as? NSColor {
+                borderColor.setStroke()
+                path.lineWidth = 1.25
+                path.stroke()
             }
         }
     }
@@ -988,6 +1650,12 @@ func tintedSymbol(_ name: String, color: NSColor) -> NSImage? {
 
 // MARK: - Main View
 class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
+    private struct CodeBlockInfo {
+        let fullRange: NSRange
+        let contentRange: NSRange
+        let label: String?
+    }
+
     private var scrollView: NSScrollView!
     private var textView: ClickableTextView!
     private var headerView: NSView!
@@ -1009,6 +1677,14 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
     private var noteLinkAutocompleteStart: Int = 0  // Position of the [[ characters
     private var previousTitle: String = ""  // Track title for backlink updates
     private var metadataBarView: MetadataBarView!
+    private var codeBlockInfos: [CodeBlockInfo] = []
+    private var codeBlockCopyButtons: [NSButton] = []
+    private var codeBlockInfoLabels: [NSTextField] = []
+    private let autoDeleteEmptyNotesKey = "floatmd_auto_delete_empty_notes"
+
+    private var autoDeleteEmptyNotesEnabled: Bool {
+        UserDefaults.standard.bool(forKey: autoDeleteEmptyNotesKey)
+    }
 
     private let baseFont = NSFont.systemFont(ofSize: 14, weight: .regular)
     private let h1Font = NSFont.systemFont(ofSize: 28, weight: .bold)
@@ -1140,6 +1816,8 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         scrollView.autoresizingMask = [.width, .height]
 
         // Create text system with custom layout manager for pill backgrounds
+        let editorInset: CGFloat = 15
+
         let textStorage = NSTextStorage()
         let layoutManager = PillBackgroundLayoutManager()
         textStorage.addLayoutManager(layoutManager)
@@ -1153,7 +1831,7 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         textView.drawsBackground = false
         textView.isRichText = true
         textView.allowsUndo = true
-        textView.textContainerInset = NSSize(width: 15, height: 15)
+        textView.textContainerInset = NSSize(width: editorInset, height: 15)
         textView.insertionPointColor = theme.cursor
         textView.typingAttributes = [.font: baseFont, .foregroundColor: textColor]
         textView.textStorage?.delegate = self
@@ -1162,6 +1840,9 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         textView.isHorizontallyResizable = false
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.minSize = NSSize(width: 0, height: scrollView.contentSize.height)
+        layoutManager.codeBlockXOffset = 0
+        layoutManager.codeBlockYOffset = 0
+        layoutManager.codeBlockHorizontalInset = 0
 
         textView.onCheckboxClick = { [weak self] range in self?.toggleCheckbox(at: range) }
         textView.onWikiLinkClick = { [weak self] target in self?.navigateToNote(titled: target) }
@@ -1193,6 +1874,7 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
             let newWidth = scrollView.contentSize.width - 30
             textContainer.containerSize = NSSize(width: newWidth, height: CGFloat.greatestFiniteMagnitude)
         }
+        layoutCodeBlockCopyButtons()
         // Update workspace indicator for adaptive display
         updateWorkspaceIndicator()
     }
@@ -1212,6 +1894,9 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
     }
 
     private func cleanupEmptyNote() {
+        // Disabled by default to avoid accidental note loss.
+        guard autoDeleteEmptyNotesEnabled else { return }
+
         // Auto-delete the current note if it's empty or only whitespace
         // Check the textView content directly to avoid race conditions
         let currentContent = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1315,6 +2000,29 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         let lineRange = nsText.lineRange(for: NSRange(location: cursorPos, length: 0))
         let currentLine = nsText.substring(with: lineRange).trimmingCharacters(in: .newlines)
 
+        // Markdown fenced code block completion:
+        // When current line is "```", Tab inserts closing fence and places cursor inside.
+        if !isShift, shouldCompleteCodeFence(at: cursorPos, in: nsText, lineRange: lineRange) {
+            let lineContentRange = lineRangeWithoutTrailingNewline(lineRange, in: nsText)
+            let lineText = nsText.substring(with: lineContentRange)
+            let indent = String(lineText.prefix { $0 == " " || $0 == "\t" })
+            let insertText = "\n\(indent)\n\(indent)```"
+
+            isUpdatingFormatting = true
+            textStorage.insert(NSAttributedString(string: insertText, attributes: [.font: baseFont, .foregroundColor: textColor]), at: cursorPos)
+            textView.setSelectedRange(NSRange(location: cursorPos + 1 + indent.count, length: 0))
+            isUpdatingFormatting = false
+            saveContent()
+            DispatchQueue.main.async { [weak self] in self?.applyMarkdownFormatting() }
+            return true
+        }
+
+        // Inside a fenced code block: Tab jumps out of the block.
+        if !isShift, let block = codeBlockContainingCursor(cursorPos, in: text) {
+            moveCursorOutOfCodeBlock(block, in: textStorage)
+            return true
+        }
+
         let listPatterns = ["^\\t*- \\[([ xX])\\] ", "^\\t*\\[([ xX])\\]", "^\\t*([-*+]) ", "^\\t*\\d+\\. ", "^\\t*> "]
         var isListLine = false
         for pattern in listPatterns {
@@ -1341,6 +2049,137 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         saveContent()
         DispatchQueue.main.async { [weak self] in self?.applyMarkdownFormatting() }
         return true
+    }
+
+    private func lineRangeWithoutTrailingNewline(_ lineRange: NSRange, in text: NSString) -> NSRange {
+        var range = lineRange
+        if range.length > 0 {
+            let lastCharIndex = range.location + range.length - 1
+            if text.character(at: lastCharIndex) == 10 { // '\n'
+                range.length -= 1
+            }
+        }
+        return range
+    }
+
+    private func shouldCompleteCodeFence(at cursorPos: Int, in text: NSString, lineRange: NSRange) -> Bool {
+        let contentRange = lineRangeWithoutTrailingNewline(lineRange, in: text)
+        guard cursorPos >= contentRange.location, cursorPos <= NSMaxRange(contentRange) else { return false }
+
+        let fullLineText = text.substring(with: contentRange).trimmingCharacters(in: .whitespaces)
+        if fullLineText != "```" { return false }
+        if isLikelyClosingFenceLine(lineStart: contentRange.location, in: text) { return false }
+
+        let beforeRange = NSRange(location: contentRange.location, length: cursorPos - contentRange.location)
+        let afterRange = NSRange(location: cursorPos, length: NSMaxRange(contentRange) - cursorPos)
+        let beforeText = text.substring(with: beforeRange)
+        let afterText = text.substring(with: afterRange)
+
+        return beforeText.trimmingCharacters(in: .whitespaces) == "```"
+            && afterText.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    private func isLikelyClosingFenceLine(lineStart: Int, in text: NSString) -> Bool {
+        guard lineStart > 0 else { return false }
+        let prefixRange = NSRange(location: 0, length: lineStart)
+        let prefixText = text.substring(with: prefixRange)
+        guard let regex = try? NSRegularExpression(pattern: "(?m)^\\s*```[^\\n]*\\s*$", options: []) else { return false }
+        let matchCount = regex.numberOfMatches(
+            in: prefixText,
+            options: [],
+            range: NSRange(location: 0, length: (prefixText as NSString).length)
+        )
+        // Odd number of prior fences means we're currently inside an open fenced block.
+        return (matchCount % 2) == 1
+    }
+
+    private func codeBlockContainingCursor(_ cursorPos: Int, in text: String) -> CodeBlockInfo? {
+        let blocks = findCodeBlocks(in: text)
+        for block in blocks {
+            let start = block.contentRange.location
+            let end = block.contentRange.location + block.contentRange.length
+            if cursorPos >= start && cursorPos <= end {
+                return block
+            }
+        }
+        return nil
+    }
+
+    private func moveCursorOutOfCodeBlock(_ block: CodeBlockInfo, in textStorage: NSTextStorage) {
+        var text = textStorage.string as NSString
+        let closeFenceStart = max(block.fullRange.location, block.fullRange.location + block.fullRange.length - 1)
+        let closeFenceRange = text.lineRange(for: NSRange(location: closeFenceStart, length: 0))
+        let afterCloseFence = closeFenceRange.location + closeFenceRange.length
+        var target = afterCloseFence
+        var didInsert = false
+
+        let closeFenceEndsWithNewline =
+            closeFenceRange.length > 0 &&
+            (closeFenceRange.location + closeFenceRange.length - 1) < text.length &&
+            text.character(at: closeFenceRange.location + closeFenceRange.length - 1) == 10
+
+        // Always leave one blank line after the fence and place the cursor on the line after that.
+        if afterCloseFence >= text.length {
+            let trailing = closeFenceEndsWithNewline ? "\n" : "\n\n"
+            isUpdatingFormatting = true
+            textStorage.insert(
+                NSAttributedString(string: trailing, attributes: [.font: baseFont, .foregroundColor: textColor]),
+                at: text.length
+            )
+            isUpdatingFormatting = false
+            didInsert = true
+            text = textStorage.string as NSString
+            target = min(afterCloseFence + trailing.utf16.count, text.length)
+        } else {
+            let nextLineRange = text.lineRange(for: NSRange(location: afterCloseFence, length: 0))
+            let nextLineContentRange = lineRangeWithoutTrailingNewline(nextLineRange, in: text)
+            let nextLineText = text.substring(with: nextLineContentRange).trimmingCharacters(in: .whitespaces)
+
+            if nextLineText.isEmpty {
+                target = nextLineRange.location + nextLineRange.length
+                if target >= text.length {
+                    isUpdatingFormatting = true
+                    textStorage.insert(
+                        NSAttributedString(string: "\n", attributes: [.font: baseFont, .foregroundColor: textColor]),
+                        at: text.length
+                    )
+                    isUpdatingFormatting = false
+                    didInsert = true
+                    text = textStorage.string as NSString
+                    target = text.length
+                }
+            } else {
+                isUpdatingFormatting = true
+                textStorage.insert(
+                    NSAttributedString(string: "\n", attributes: [.font: baseFont, .foregroundColor: textColor]),
+                    at: afterCloseFence
+                )
+                isUpdatingFormatting = false
+                didInsert = true
+                text = textStorage.string as NSString
+                target = min(afterCloseFence + 1, text.length)
+            }
+        }
+
+        textView.setSelectedRange(NSRange(location: min(target, (textStorage.string as NSString).length), length: 0))
+        if didInsert {
+            saveContent()
+            DispatchQueue.main.async { [weak self] in self?.applyMarkdownFormatting() }
+        }
+    }
+
+    private func shouldArrowDownExitCodeBlock(_ block: CodeBlockInfo, cursorPos: Int, in text: NSString) -> Bool {
+        if text.length == 0 { return false }
+
+        let currentLocation = min(max(cursorPos, 0), max(text.length - 1, 0))
+        let currentLine = text.lineRange(for: NSRange(location: currentLocation, length: 0))
+
+        let lastContentLocation = block.contentRange.length > 0
+            ? min(block.contentRange.location + block.contentRange.length - 1, max(text.length - 1, 0))
+            : min(block.contentRange.location, max(text.length - 1, 0))
+        let lastContentLine = text.lineRange(for: NSRange(location: lastContentLocation, length: 0))
+
+        return NSEqualRanges(currentLine, lastContentLine)
     }
 
     private func handleEnterKey() -> Bool {
@@ -1736,6 +2575,20 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
             }
             return true
         }
+
+        // If cursor is on the last line inside a code block, down arrow exits the box.
+        if isDown {
+            let text = textView.string
+            let cursorPos = textView.selectedRange().location
+            let nsText = text as NSString
+            guard let textStorage = textView.textStorage else { return false }
+            if let block = codeBlockContainingCursor(cursorPos, in: text),
+               shouldArrowDownExitCodeBlock(block, cursorPos: cursorPos, in: nsText) {
+                moveCursorOutOfCodeBlock(block, in: textStorage)
+                return true
+            }
+        }
+
         // Then check tag autocomplete
         guard let autocomplete = tagAutocompleteView else { return false }
         if isDown {
@@ -1820,6 +2673,8 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         let fullRange = NSRange(location: 0, length: textStorage.length)
         let text = textStorage.string
         let cursorLineRange = getLineRange(forLine: cursorLine, in: text)
+        clearCodeBlockOverlays()
+        codeBlockInfos = []
 
         textStorage.addAttributes([.font: baseFont, .foregroundColor: textColor], range: fullRange)
         textStorage.removeAttribute(.init("isCheckbox"), range: fullRange)
@@ -1831,9 +2686,12 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         textStorage.removeAttribute(.init("workspaceEditor"), range: fullRange)
         textStorage.removeAttribute(.init("workspacePillBackground"), range: fullRange)
         textStorage.removeAttribute(.init("workspaceClickTarget"), range: fullRange)
+        textStorage.removeAttribute(.init("codeBlockBackground"), range: fullRange)
+        textStorage.removeAttribute(.init("codeBlockBorderColor"), range: fullRange)
         textStorage.removeAttribute(.backgroundColor, range: fullRange)
         textStorage.removeAttribute(.strikethroughStyle, range: fullRange)
         textStorage.removeAttribute(.underlineStyle, range: fullRange)
+        textStorage.removeAttribute(.paragraphStyle, range: fullRange)
 
         var lineNum = 0
         var lineStart = text.startIndex
@@ -1847,7 +2705,197 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         }
 
         applyInlineFormatting(to: textStorage, in: text, cursorLineRange: cursorLineRange)
+
+        let codeBlocks = findCodeBlocks(in: text)
+        applyCodeBlockFormatting(codeBlocks, to: textStorage, in: text, cursorLineRange: cursorLineRange)
+        codeBlockInfos = codeBlocks
+        DispatchQueue.main.async { [weak self] in
+            self?.layoutCodeBlockCopyButtons()
+        }
+
         isUpdatingFormatting = false
+    }
+
+    private func findCodeBlocks(in text: String) -> [CodeBlockInfo] {
+        // Fenced markdown code blocks:
+        // ```lang
+        // code...
+        // ```
+        guard let regex = try? NSRegularExpression(
+            pattern: "(?ms)^```([^\\n]*)\\n(.*?)^```[ \\t]*$",
+            options: [.anchorsMatchLines, .dotMatchesLineSeparators]
+        ) else { return [] }
+
+        let nsText = text as NSString
+        let fullRange = NSRange(location: 0, length: text.utf16.count)
+        return regex.matches(in: text, options: [], range: fullRange).compactMap { match in
+            guard match.numberOfRanges > 2 else { return nil }
+            let rawLabel = nsText.substring(with: match.range(at: 1))
+            let label = parseCodeFenceLabel(rawLabel)
+            return CodeBlockInfo(fullRange: match.range(at: 0), contentRange: match.range(at: 2), label: label)
+        }
+    }
+
+    private func parseCodeFenceLabel(_ raw: String) -> String? {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasPrefix("{"), value.hasSuffix("}"), value.count > 2 {
+            value = String(value.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return value.isEmpty ? nil : value
+    }
+
+    private func applyCodeBlockFormatting(
+        _ codeBlocks: [CodeBlockInfo],
+        to textStorage: NSTextStorage,
+        in text: String,
+        cursorLineRange: NSRange?
+    ) {
+        let nsText = text as NSString
+
+        for block in codeBlocks {
+            guard block.fullRange.location != NSNotFound, block.contentRange.location != NSNotFound else { continue }
+
+            // Ensure inline-code background styling does not leak into fenced code blocks.
+            textStorage.removeAttribute(.backgroundColor, range: block.fullRange)
+
+            let codeParagraph = NSMutableParagraphStyle()
+            codeParagraph.firstLineHeadIndent = 8
+            codeParagraph.headIndent = 8
+            textStorage.addAttribute(.paragraphStyle, value: codeParagraph, range: block.fullRange)
+
+            let openFenceRange = nsText.lineRange(for: NSRange(location: block.fullRange.location, length: 0))
+            let closeFenceStart = max(block.fullRange.location, block.fullRange.location + block.fullRange.length - 1)
+            let closeFenceRange = nsText.lineRange(for: NSRange(location: closeFenceStart, length: 0))
+
+            let syntaxStyle = isCursorNear(openFenceRange, cursorLineRange: cursorLineRange) || isCursorNear(closeFenceRange, cursorLineRange: cursorLineRange)
+                ? syntaxColor
+                : hiddenColor
+
+            textStorage.addAttribute(.foregroundColor, value: syntaxStyle, range: openFenceRange)
+            textStorage.addAttribute(.foregroundColor, value: syntaxStyle, range: closeFenceRange)
+            textStorage.addAttribute(.init("codeBlockBackground"), value: NSColor.clear, range: block.fullRange)
+            textStorage.addAttribute(.init("codeBlockBorderColor"), value: theme.secondaryText.withAlphaComponent(0.30), range: block.fullRange)
+
+            if block.contentRange.length > 0 {
+                // Keep code blocks literal: remove markdown click targets/styles within them.
+                textStorage.removeAttribute(.init("isCheckbox"), range: block.contentRange)
+                textStorage.removeAttribute(.init("checkboxRange"), range: block.contentRange)
+                textStorage.removeAttribute(.init("wikiLinkTarget"), range: block.contentRange)
+                textStorage.removeAttribute(.init("tagPillBackground"), range: block.contentRange)
+                textStorage.removeAttribute(.init("tagName"), range: block.contentRange)
+                textStorage.removeAttribute(.init("workspacePath"), range: block.contentRange)
+                textStorage.removeAttribute(.init("workspaceEditor"), range: block.contentRange)
+                textStorage.removeAttribute(.init("workspacePillBackground"), range: block.contentRange)
+                textStorage.removeAttribute(.init("workspaceClickTarget"), range: block.contentRange)
+                textStorage.removeAttribute(.underlineStyle, range: block.contentRange)
+                textStorage.removeAttribute(.strikethroughStyle, range: block.contentRange)
+
+                textStorage.addAttribute(.font, value: codeFont, range: block.contentRange)
+                textStorage.addAttribute(.foregroundColor, value: textColor, range: block.contentRange)
+            }
+        }
+    }
+
+    @objc private func copyCodeBlock(_ sender: NSButton) {
+        let index = sender.tag
+        guard index >= 0, index < codeBlockInfos.count else { return }
+        let contentRange = codeBlockInfos[index].contentRange
+        let nsText = textView.string as NSString
+        guard NSMaxRange(contentRange) <= nsText.length else { return }
+
+        let code = nsText.substring(with: contentRange)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(code, forType: .string)
+
+        let originalTitle = sender.title
+        sender.title = "Copied"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak sender] in
+            sender?.title = originalTitle
+        }
+    }
+
+    private func clearCodeBlockOverlays() {
+        for button in codeBlockCopyButtons {
+            button.removeFromSuperview()
+        }
+        codeBlockCopyButtons.removeAll()
+        for label in codeBlockInfoLabels {
+            label.removeFromSuperview()
+        }
+        codeBlockInfoLabels.removeAll()
+    }
+
+    private func layoutCodeBlockCopyButtons() {
+        clearCodeBlockOverlays()
+        guard !codeBlockInfos.isEmpty,
+              let layoutManager = textView.layoutManager as? PillBackgroundLayoutManager,
+              let textContainer = textView.textContainer else { return }
+
+        layoutManager.ensureLayout(for: textContainer)
+
+        for (index, block) in codeBlockInfos.enumerated() {
+            let glyphRange = layoutManager.glyphRange(forCharacterRange: block.fullRange, actualCharacterRange: nil)
+            guard glyphRange.location != NSNotFound, glyphRange.length > 0 else { continue }
+
+            var unionRect = NSRect.null
+            layoutManager.enumerateEnclosingRects(
+                forGlyphRange: glyphRange,
+                withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
+                in: textContainer
+            ) { rect, _ in
+                unionRect = unionRect.isNull ? rect : unionRect.union(rect)
+            }
+            guard !unionRect.isNull else { continue }
+
+            var blockRect = unionRect
+            blockRect.size.width = textContainer.size.width
+
+            let boxRect = blockRect
+                .offsetBy(dx: layoutManager.codeBlockXOffset, dy: layoutManager.codeBlockYOffset)
+                .insetBy(dx: layoutManager.codeBlockHorizontalInset, dy: 0)
+
+            if let labelText = block.label {
+                let label = NSTextField(labelWithString: labelText)
+                label.font = .systemFont(ofSize: 10, weight: .medium)
+                label.textColor = theme.secondaryText.withAlphaComponent(0.85)
+                label.lineBreakMode = .byTruncatingTail
+                label.isEditable = false
+                label.isSelectable = false
+                let labelWidth = max(40, boxRect.width - 84)
+                label.frame = NSRect(
+                    x: boxRect.minX + 8,
+                    y: boxRect.maxY - 16,
+                    width: labelWidth,
+                    height: 12
+                )
+                textView.addSubview(label)
+                codeBlockInfoLabels.append(label)
+            }
+
+            let buttonWidth: CGFloat = 44
+            let buttonHeight: CGFloat = 18
+            let buttonX = max(boxRect.minX + 6, boxRect.maxX - buttonWidth - 6)
+            let buttonY = boxRect.maxY - buttonHeight - 5
+
+            let button = NSButton(frame: NSRect(x: buttonX, y: buttonY, width: buttonWidth, height: buttonHeight))
+            button.bezelStyle = NSButton.BezelStyle.inline
+            button.isBordered = false
+            button.wantsLayer = true
+            button.layer?.cornerRadius = 4
+            button.layer?.backgroundColor = theme.background.cgColor
+            button.layer?.borderWidth = 1
+            button.layer?.borderColor = theme.secondaryText.withAlphaComponent(0.35).cgColor
+            button.title = "Copy"
+            button.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+            button.contentTintColor = linkColor
+            button.tag = index
+            button.target = self
+            button.action = #selector(copyCodeBlock(_:))
+            button.toolTip = "Copy code block"
+            textView.addSubview(button)
+            codeBlockCopyButtons.append(button)
+        }
     }
 
     private func formatLine(_ line: String, range: NSRange, in textStorage: NSTextStorage, cursorOnLine: Bool) {
@@ -1913,8 +2961,26 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
             // Only hide the # if there's actual heading content after it
             if contentLength > 0 {
                 let font: NSFont = [h1Font, h2Font, h3Font, h4Font, h5Font, h6Font][min(hashCount - 1, 5)]
-                textStorage.addAttribute(.foregroundColor, value: syntaxStyle, range: NSRange(location: lineStartWithIndent, length: hashCount + 1))
+                let markerRange = NSRange(location: lineStartWithIndent, length: hashCount + 1)
+                let markerColor: NSColor = hashCount <= 2
+                    ? (cursorOnLine ? syntaxColor : hiddenColor)
+                    : syntaxStyle
+                let markerFont: NSFont = hashCount <= 2
+                    ? (cursorOnLine ? baseFont : NSFont.systemFont(ofSize: 0.1))
+                    : baseFont
+                textStorage.addAttribute(.foregroundColor, value: markerColor, range: markerRange)
+                textStorage.addAttribute(.font, value: markerFont, range: markerRange)
                 textStorage.addAttribute(.font, value: font, range: NSRange(location: lineStartWithIndent + hashCount + 1, length: contentLength))
+
+                // Add title breathing room for top-level headings.
+                if hashCount <= 2 {
+                    let paragraphStyle = NSMutableParagraphStyle()
+                    paragraphStyle.firstLineHeadIndent = 0
+                    paragraphStyle.headIndent = 0
+                    paragraphStyle.paragraphSpacingBefore = hashCount == 1 ? 10 : 8
+                    paragraphStyle.paragraphSpacing = hashCount == 1 ? 14 : 11
+                    textStorage.addAttribute(.paragraphStyle, value: paragraphStyle, range: range)
+                }
             }
             // If no content, keep # visible so user can see and delete it
         }
@@ -1994,7 +3060,7 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
             }
         }
 
-        applyPattern("`([^`]+)`", to: textStorage, in: text) { range, _ in
+        applyPattern("(?<!`)`([^`\\n]+)`(?!`)", to: textStorage, in: text) { range, _ in
             let style = self.isCursorNear(range, cursorLineRange: cursorLineRange) ? self.syntaxColor : self.hiddenColor
             textStorage.addAttribute(.foregroundColor, value: style, range: NSRange(location: range.location, length: 1))
             textStorage.addAttribute(.foregroundColor, value: style, range: NSRange(location: range.location + range.length - 1, length: 1))
@@ -2103,7 +3169,7 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
                 } else {
                     // Display as condensed pill when not editing
                     // Show editor name + project name, hide syntax and directory path
-                    // @cursor[/path/to/FloatMD.code-workspace] -> "cursor FloatMD.code-workspace"
+                    // @cursor[/path/to/WispMark.code-workspace] -> "cursor WispMark.code-workspace"
                     let projectName = (path as NSString).lastPathComponent
 
                     // Calculate character positions
@@ -2349,7 +3415,7 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         }
         // Handle relative paths (resolve relative to notes directory)
         else if !resolved.hasPrefix("/") {
-            let notesDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? ""
+            let notesDir = NotesManager.shared.notesDirectoryURL.path
             resolved = (notesDir as NSString).appendingPathComponent(resolved)
         }
 
@@ -3016,7 +4082,7 @@ class TagSearchView: NSView {
         refreshResults()
     }
     private func refreshResults() {
-        NSLog("FloatNote: refreshResults called with \(results.count) results")
+        NSLog("WispMark: refreshResults called with \(results.count) results")
 
         // Clear existing results
         resultsStackView.arrangedSubviews.forEach { $0.removeFromSuperview() }
@@ -3438,18 +4504,9 @@ class SettingsView: NSView {
     private var themeButtons: [NSButton] = []
     private var titleLabel: NSTextField!
     private var themeLabel: NSTextField!
-    private var injectionLabel: NSTextField!
-    private var hotkeyLabel: NSTextField!
     private var hotkeysLabel: NSTextField!
-    private var injectionHotkeyLabel: NSTextField!
-    private var injectionHotkeyRecorder: HotkeyRecorderView!
     private var toggleHotkeyLabel: NSTextField!
     private var toggleHotkeyRecorder: HotkeyRecorderView!
-    private var cutInjectHotkeyLabel: NSTextField!
-    private var cutInjectHotkeyRecorder: HotkeyRecorderView!
-    private var ignoreTitlesCheckbox: NSButton!
-    private var ignoreTagsCheckbox: NSButton!
-    private var ignoreLinkFormattingCheckbox: NSButton!
     private var workspaceLabel: NSTextField!
     private var defaultEditorLabel: NSTextField!
     private var defaultEditorPopup: NSPopUpButton!
@@ -3508,40 +4565,15 @@ class SettingsView: NSView {
         hotkeysLabel.autoresizingMask = [.minYMargin]
         addSubview(hotkeysLabel)
 
-        // Injection hotkey
-        injectionHotkeyLabel = NSTextField(labelWithString: "Injection:")
-        injectionHotkeyLabel.font = .systemFont(ofSize: 12)
-        injectionHotkeyLabel.textColor = ThemeManager.shared.currentTheme.text.withAlphaComponent(0.6)
-        injectionHotkeyLabel.frame = NSRect(x: 20, y: bounds.height - 250, width: 70, height: 18)
-        injectionHotkeyLabel.autoresizingMask = [.minYMargin]
-        addSubview(injectionHotkeyLabel)
-
-        injectionHotkeyRecorder = HotkeyRecorderView(frame: NSRect(x: 95, y: bounds.height - 252, width: 180, height: 22))
-        injectionHotkeyRecorder.autoresizingMask = [.minYMargin]
-        injectionHotkeyRecorder.setHotkey(
-            keyCode: InjectionSettings.shared.injectionKeyCode,
-            modifiers: InjectionSettings.shared.injectionModifiers,
-            display: InjectionSettings.shared.injectionDisplay
-        )
-        injectionHotkeyRecorder.onHotkeyChanged = { keyCode, modifiers, display in
-            InjectionSettings.shared.injectionKeyCode = keyCode
-            InjectionSettings.shared.injectionModifiers = modifiers
-            InjectionSettings.shared.injectionDisplay = display
-            // Unregister and re-register hotkeys
-            HotkeyManager.shared.unregister()
-            HotkeyManager.shared.register()
-        }
-        addSubview(injectionHotkeyRecorder)
-
         // Toggle hotkey
         toggleHotkeyLabel = NSTextField(labelWithString: "Toggle:")
         toggleHotkeyLabel.font = .systemFont(ofSize: 12)
         toggleHotkeyLabel.textColor = ThemeManager.shared.currentTheme.text.withAlphaComponent(0.6)
-        toggleHotkeyLabel.frame = NSRect(x: 20, y: bounds.height - 280, width: 70, height: 18)
+        toggleHotkeyLabel.frame = NSRect(x: 20, y: bounds.height - 250, width: 70, height: 18)
         toggleHotkeyLabel.autoresizingMask = [.minYMargin]
         addSubview(toggleHotkeyLabel)
 
-        toggleHotkeyRecorder = HotkeyRecorderView(frame: NSRect(x: 95, y: bounds.height - 282, width: 180, height: 22))
+        toggleHotkeyRecorder = HotkeyRecorderView(frame: NSRect(x: 95, y: bounds.height - 252, width: 180, height: 22))
         toggleHotkeyRecorder.autoresizingMask = [.minYMargin]
         toggleHotkeyRecorder.setHotkey(
             keyCode: InjectionSettings.shared.toggleKeyCode,
@@ -3558,65 +4590,11 @@ class SettingsView: NSView {
         }
         addSubview(toggleHotkeyRecorder)
 
-        // Cut-inject hotkey
-        cutInjectHotkeyLabel = NSTextField(labelWithString: "Cut+Inject:")
-        cutInjectHotkeyLabel.font = .systemFont(ofSize: 12)
-        cutInjectHotkeyLabel.textColor = ThemeManager.shared.currentTheme.text.withAlphaComponent(0.6)
-        cutInjectHotkeyLabel.frame = NSRect(x: 20, y: bounds.height - 310, width: 70, height: 18)
-        cutInjectHotkeyLabel.autoresizingMask = [.minYMargin]
-        addSubview(cutInjectHotkeyLabel)
-
-        cutInjectHotkeyRecorder = HotkeyRecorderView(frame: NSRect(x: 95, y: bounds.height - 312, width: 180, height: 22))
-        cutInjectHotkeyRecorder.autoresizingMask = [.minYMargin]
-        cutInjectHotkeyRecorder.setHotkey(
-            keyCode: InjectionSettings.shared.cutInjectKeyCode,
-            modifiers: InjectionSettings.shared.cutInjectModifiers,
-            display: InjectionSettings.shared.cutInjectDisplay
-        )
-        cutInjectHotkeyRecorder.onHotkeyChanged = { keyCode, modifiers, display in
-            InjectionSettings.shared.cutInjectKeyCode = keyCode
-            InjectionSettings.shared.cutInjectModifiers = modifiers
-            InjectionSettings.shared.cutInjectDisplay = display
-            // Unregister and re-register hotkeys
-            HotkeyManager.shared.unregister()
-            HotkeyManager.shared.register()
-        }
-        addSubview(cutInjectHotkeyRecorder)
-
-        // Injection Settings section
-        injectionLabel = NSTextField(labelWithString: "Injection Settings")
-        injectionLabel.font = .systemFont(ofSize: 14, weight: .medium)
-        injectionLabel.textColor = ThemeManager.shared.currentTheme.text.withAlphaComponent(0.7)
-        injectionLabel.frame = NSRect(x: 20, y: bounds.height - 350, width: 200, height: 20)
-        injectionLabel.autoresizingMask = [.minYMargin]
-        addSubview(injectionLabel)
-
-        // Ignore titles checkbox
-        ignoreTitlesCheckbox = NSButton(checkboxWithTitle: "Ignore titles (# headings)", target: self, action: #selector(ignoreTitlesToggled))
-        ignoreTitlesCheckbox.frame = NSRect(x: 20, y: bounds.height - 375, width: 250, height: 20)
-        ignoreTitlesCheckbox.state = InjectionSettings.shared.ignoreTitles ? .on : .off
-        ignoreTitlesCheckbox.autoresizingMask = [.minYMargin]
-        addSubview(ignoreTitlesCheckbox)
-
-        // Ignore tags checkbox
-        ignoreTagsCheckbox = NSButton(checkboxWithTitle: "Ignore tags", target: self, action: #selector(ignoreTagsToggled))
-        ignoreTagsCheckbox.frame = NSRect(x: 20, y: bounds.height - 400, width: 250, height: 20)
-        ignoreTagsCheckbox.state = InjectionSettings.shared.ignoreTags ? .on : .off
-        ignoreTagsCheckbox.autoresizingMask = [.minYMargin]
-        addSubview(ignoreTagsCheckbox)
-
-        // Ignore link formatting checkbox
-        ignoreLinkFormattingCheckbox = NSButton(checkboxWithTitle: "Ignore link formatting", target: self, action: #selector(ignoreLinkFormattingToggled))
-        ignoreLinkFormattingCheckbox.frame = NSRect(x: 20, y: bounds.height - 425, width: 250, height: 20)
-        ignoreLinkFormattingCheckbox.state = InjectionSettings.shared.ignoreLinkFormatting ? .on : .off
-        ignoreLinkFormattingCheckbox.autoresizingMask = [.minYMargin]
-        addSubview(ignoreLinkFormattingCheckbox)
-
         // Workspace Settings section
         workspaceLabel = NSTextField(labelWithString: "Workspace Settings")
         workspaceLabel.font = .systemFont(ofSize: 14, weight: .medium)
         workspaceLabel.textColor = ThemeManager.shared.currentTheme.text.withAlphaComponent(0.7)
-        workspaceLabel.frame = NSRect(x: 20, y: bounds.height - 435, width: 200, height: 20)
+        workspaceLabel.frame = NSRect(x: 20, y: bounds.height - 290, width: 200, height: 20)
         workspaceLabel.autoresizingMask = [.minYMargin]
         addSubview(workspaceLabel)
 
@@ -3624,12 +4602,12 @@ class SettingsView: NSView {
         defaultEditorLabel = NSTextField(labelWithString: "Default Editor:")
         defaultEditorLabel.font = .systemFont(ofSize: 12)
         defaultEditorLabel.textColor = ThemeManager.shared.currentTheme.text.withAlphaComponent(0.6)
-        defaultEditorLabel.frame = NSRect(x: 20, y: bounds.height - 465, width: 100, height: 18)
+        defaultEditorLabel.frame = NSRect(x: 20, y: bounds.height - 320, width: 100, height: 18)
         defaultEditorLabel.autoresizingMask = [.minYMargin]
         addSubview(defaultEditorLabel)
 
         // Default editor popup
-        defaultEditorPopup = NSPopUpButton(frame: NSRect(x: 125, y: bounds.height - 468, width: 150, height: 24), pullsDown: false)
+        defaultEditorPopup = NSPopUpButton(frame: NSRect(x: 125, y: bounds.height - 323, width: 150, height: 24), pullsDown: false)
         defaultEditorPopup.addItems(withTitles: ["VS Code", "Cursor", "Antigravity"])
         defaultEditorPopup.target = self
         defaultEditorPopup.action = #selector(defaultEditorChanged)
@@ -3698,18 +4676,6 @@ class SettingsView: NSView {
         applyThemePreview()
     }
 
-    @objc private func ignoreTitlesToggled(_ sender: NSButton) {
-        InjectionSettings.shared.ignoreTitles = (sender.state == .on)
-    }
-
-    @objc private func ignoreTagsToggled(_ sender: NSButton) {
-        InjectionSettings.shared.ignoreTags = (sender.state == .on)
-    }
-
-    @objc private func ignoreLinkFormattingToggled(_ sender: NSButton) {
-        InjectionSettings.shared.ignoreLinkFormatting = (sender.state == .on)
-    }
-
     @objc private func defaultEditorChanged(_ sender: NSPopUpButton) {
         let editors = ["vscode", "cursor", "anti"]
         if sender.indexOfSelectedItem >= 0 && sender.indexOfSelectedItem < editors.count {
@@ -3739,15 +4705,11 @@ class SettingsView: NSView {
         titleLabel.textColor = theme.text
         themeLabel.textColor = theme.text.withAlphaComponent(0.7)
         hotkeysLabel.textColor = theme.text.withAlphaComponent(0.7)
-        injectionHotkeyLabel.textColor = theme.text.withAlphaComponent(0.6)
         toggleHotkeyLabel.textColor = theme.text.withAlphaComponent(0.6)
-        injectionLabel.textColor = theme.text.withAlphaComponent(0.7)
+        workspaceLabel.textColor = theme.text.withAlphaComponent(0.7)
+        defaultEditorLabel.textColor = theme.text.withAlphaComponent(0.6)
 
         // Update hotkey recorder views
-        injectionHotkeyRecorder.backgroundColor = theme.background
-        injectionHotkeyRecorder.textColor = theme.text
-        injectionHotkeyRecorder.layer?.borderColor = theme.text.withAlphaComponent(0.3).cgColor
-
         toggleHotkeyRecorder.backgroundColor = theme.background
         toggleHotkeyRecorder.textColor = theme.text
         toggleHotkeyRecorder.layer?.borderColor = theme.text.withAlphaComponent(0.3).cgColor
@@ -3780,6 +4742,7 @@ class NoteBrowserView: NSView, NSTextFieldDelegate {
     private var tagPillsView: NSView!
     private var tagAutocompleteView: TagAutocompleteView?
     private var settingsButton: NSButton!
+    private var versionLabel: NSTextField!
     private var rows: [BrowserRow] = []
     private var selectedTags: [String] = []
     private var tagAutocompleteStart: Int = 0
@@ -3803,6 +4766,7 @@ class NoteBrowserView: NSView, NSTextFieldDelegate {
 
     @objc private func themeDidChange() {
         settingsButton.image = tintedSymbol("gearshape", color: ThemeManager.shared.currentTheme.icon)
+        versionLabel.textColor = ThemeManager.shared.currentTheme.secondaryText
         tableView.reloadData()
     }
 
@@ -3840,6 +4804,17 @@ class NoteBrowserView: NSView, NSTextFieldDelegate {
         settingsButton.action = #selector(settingsPressed)
         bottomBar.addSubview(settingsButton)
 
+        versionLabel = NSTextField(labelWithString: appVersionLabel())
+        versionLabel.font = .systemFont(ofSize: 10)
+        versionLabel.textColor = ThemeManager.shared.currentTheme.secondaryText
+        versionLabel.alignment = .right
+        versionLabel.lineBreakMode = .byTruncatingMiddle
+        versionLabel.frame = NSRect(x: 44, y: 9, width: bounds.width - 54, height: 18)
+        versionLabel.autoresizingMask = [.width]
+        versionLabel.isEditable = false
+        versionLabel.isSelectable = false
+        bottomBar.addSubview(versionLabel)
+
         scrollView = NSScrollView(frame: NSRect(x: 0, y: bottomBarHeight, width: bounds.width, height: bounds.height - 40 - bottomBarHeight))
         scrollView.drawsBackground = false
         scrollView.hasVerticalScroller = true
@@ -3859,6 +4834,14 @@ class NoteBrowserView: NSView, NSTextFieldDelegate {
 
         scrollView.documentView = tableView
         addSubview(scrollView)
+    }
+
+    private func appVersionLabel() -> String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "dev"
+        let build = info?["CFBundleVersion"] as? String ?? "0"
+        let commit = (info?["WispMarkGitCommit"] as? String) ?? (info?["FloatMDGitCommit"] as? String) ?? "unknown"
+        return "v\(version) (\(build), \(commit))"
     }
 
     @objc private func settingsPressed() {
@@ -4456,74 +5439,17 @@ extension NoteBrowserView: NSTableViewDelegate, NSTableViewDataSource {
     }
 }
 
-// MARK: - Injection Settings Manager
+// MARK: - App Settings Manager
 class InjectionSettings {
     static let shared = InjectionSettings()
 
-    private let ignoreTitlesKey = "FloatNote.InjectionSettings.IgnoreTitles"
-    private let ignoreTagsKey = "FloatNote.InjectionSettings.IgnoreTags"
-    private let ignoreLinkFormattingKey = "FloatNote.InjectionSettings.IgnoreLinkFormatting"
-    private let hotkeyDisplayKey = "FloatNote.InjectionSettings.HotkeyDisplay"
-
-    // Injection hotkey settings
-    private let injectionKeyCodeKey = "FloatNote.Hotkey.Injection.KeyCode"
-    private let injectionModifiersKey = "FloatNote.Hotkey.Injection.Modifiers"
-    private let injectionDisplayKey = "FloatNote.Hotkey.Injection.Display"
-
     // Toggle hotkey settings
-    private let toggleKeyCodeKey = "FloatNote.Hotkey.Toggle.KeyCode"
-    private let toggleModifiersKey = "FloatNote.Hotkey.Toggle.Modifiers"
-    private let toggleDisplayKey = "FloatNote.Hotkey.Toggle.Display"
-
-    // Cut-inject hotkey settings
-    private let cutInjectKeyCodeKey = "FloatNote.Hotkey.CutInject.KeyCode"
-    private let cutInjectModifiersKey = "FloatNote.Hotkey.CutInject.Modifiers"
-    private let cutInjectDisplayKey = "FloatNote.Hotkey.CutInject.Display"
+    private let toggleKeyCodeKey = "WispMark.Hotkey.Toggle.KeyCode"
+    private let toggleModifiersKey = "WispMark.Hotkey.Toggle.Modifiers"
+    private let toggleDisplayKey = "WispMark.Hotkey.Toggle.Display"
 
     // Workspace tag settings
-    private let defaultEditorKey = "FloatNote.Workspace.DefaultEditor"
-
-    var ignoreTitles: Bool {
-        get { UserDefaults.standard.bool(forKey: ignoreTitlesKey) }
-        set { UserDefaults.standard.set(newValue, forKey: ignoreTitlesKey) }
-    }
-
-    var ignoreTags: Bool {
-        get { UserDefaults.standard.bool(forKey: ignoreTagsKey) }
-        set { UserDefaults.standard.set(newValue, forKey: ignoreTagsKey) }
-    }
-
-    var ignoreLinkFormatting: Bool {
-        get { UserDefaults.standard.bool(forKey: ignoreLinkFormattingKey) }
-        set { UserDefaults.standard.set(newValue, forKey: ignoreLinkFormattingKey) }
-    }
-
-    var hotkeyDisplay: String {
-        get { UserDefaults.standard.string(forKey: hotkeyDisplayKey) ?? "Cmd+Opt+I" }
-        set { UserDefaults.standard.set(newValue, forKey: hotkeyDisplayKey) }
-    }
-
-    // Injection hotkey configuration
-    var injectionKeyCode: UInt32 {
-        get {
-            let stored = UserDefaults.standard.integer(forKey: injectionKeyCodeKey)
-            return stored == 0 ? 34 : UInt32(stored) // Default: 34 = 'i'
-        }
-        set { UserDefaults.standard.set(Int(newValue), forKey: injectionKeyCodeKey) }
-    }
-
-    var injectionModifiers: UInt32 {
-        get {
-            let stored = UserDefaults.standard.integer(forKey: injectionModifiersKey)
-            return stored == 0 ? UInt32(cmdKey | optionKey) : UInt32(stored) // Default: Cmd+Opt
-        }
-        set { UserDefaults.standard.set(Int(newValue), forKey: injectionModifiersKey) }
-    }
-
-    var injectionDisplay: String {
-        get { UserDefaults.standard.string(forKey: injectionDisplayKey) ?? "Cmd+Opt+I" }
-        set { UserDefaults.standard.set(newValue, forKey: injectionDisplayKey) }
-    }
+    private let defaultEditorKey = "WispMark.Workspace.DefaultEditor"
 
     // Toggle hotkey configuration
     var toggleKeyCode: UInt32 {
@@ -4547,71 +5473,10 @@ class InjectionSettings {
         set { UserDefaults.standard.set(newValue, forKey: toggleDisplayKey) }
     }
 
-    // Cut-inject hotkey configuration
-    var cutInjectKeyCode: UInt32 {
-        get {
-            let stored = UserDefaults.standard.integer(forKey: cutInjectKeyCodeKey)
-            return stored == 0 ? 7 : UInt32(stored) // Default: 7 = 'x'
-        }
-        set { UserDefaults.standard.set(Int(newValue), forKey: cutInjectKeyCodeKey) }
-    }
-
-    var cutInjectModifiers: UInt32 {
-        get {
-            let stored = UserDefaults.standard.integer(forKey: cutInjectModifiersKey)
-            return stored == 0 ? UInt32(cmdKey | optionKey) : UInt32(stored) // Default: Cmd+Opt
-        }
-        set { UserDefaults.standard.set(Int(newValue), forKey: cutInjectModifiersKey) }
-    }
-
-    var cutInjectDisplay: String {
-        get { UserDefaults.standard.string(forKey: cutInjectDisplayKey) ?? "Cmd+Opt+X" }
-        set { UserDefaults.standard.set(newValue, forKey: cutInjectDisplayKey) }
-    }
-
     // Default editor for @workspace[path] tags
     var defaultEditor: String {
         get { UserDefaults.standard.string(forKey: defaultEditorKey) ?? "vscode" }
         set { UserDefaults.standard.set(newValue, forKey: defaultEditorKey) }
-    }
-
-    func processContent(_ content: String) -> String {
-        var processed = content
-
-        // Remove titles (# headings)
-        if ignoreTitles {
-            processed = processed.split(separator: "\n").filter { line in
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
-                return !trimmed.hasPrefix("#")
-            }.joined(separator: "\n")
-        }
-
-        // Remove tags (#tag)
-        if ignoreTags {
-            processed = processed.replacingOccurrences(
-                of: #"#\w+"#,
-                with: "",
-                options: .regularExpression
-            )
-        }
-
-        // Remove link formatting [text](url) -> text or [[wiki]] -> wiki
-        if ignoreLinkFormatting {
-            // Convert [text](url) to text
-            processed = processed.replacingOccurrences(
-                of: #"\[([^\]]+)\]\([^\)]+\)"#,
-                with: "$1",
-                options: .regularExpression
-            )
-            // Convert [[wiki]] to wiki
-            processed = processed.replacingOccurrences(
-                of: #"\[\[([^\]]+)\]\]"#,
-                with: "$1",
-                options: .regularExpression
-            )
-        }
-
-        return processed
     }
 }
 
@@ -4643,17 +5508,11 @@ func hotkeyCallback(nextHandler: EventHandlerCallRef?, event: EventRef?, userDat
 
 class HotkeyManager {
     static let shared = HotkeyManager()
-    private var pasteHotkeyRef: EventHotKeyRef?
     private var toggleHotkeyRef: EventHotKeyRef?
     private var newNoteHotkeyRef: EventHotKeyRef?
-    private var cutPasteHotkeyRef: EventHotKeyRef?
 
     func unregister() {
         // Unregister existing hotkeys
-        if let pasteRef = pasteHotkeyRef {
-            UnregisterEventHotKey(pasteRef)
-            pasteHotkeyRef = nil
-        }
         if let toggleRef = toggleHotkeyRef {
             UnregisterEventHotKey(toggleRef)
             toggleHotkeyRef = nil
@@ -4662,61 +5521,36 @@ class HotkeyManager {
             UnregisterEventHotKey(newNoteRef)
             newNoteHotkeyRef = nil
         }
-        if let cutPasteRef = cutPasteHotkeyRef {
-            UnregisterEventHotKey(cutPasteRef)
-            cutPasteHotkeyRef = nil
-        }
-        NSLog("FloatNote: Hotkeys unregistered")
+        NSLog("WispMark: Hotkeys unregistered")
     }
 
     func register() {
         // Unregister first to avoid duplicates
         unregister()
 
-        // Use Carbon API for reliable global hotkey
-        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-
-        let status = InstallEventHandler(
-            GetApplicationEventTarget(),
-            hotkeyCallback,
-            1,
-            &eventType,
-            nil,
-            &hotkeyHandlerRef
-        )
-
-        if status != noErr {
-            NSLog("FloatNote: ERROR - Failed to install event handler: \(status)")
-            return
+        if hotkeyHandlerRef == nil {
+            // Use Carbon API for reliable global hotkey handling.
+            var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            let status = InstallEventHandler(
+                GetApplicationEventTarget(),
+                hotkeyCallback,
+                1,
+                &eventType,
+                nil,
+                &hotkeyHandlerRef
+            )
+            if status != noErr {
+                NSLog("WispMark: ERROR - Failed to install event handler: \(status)")
+                return
+            }
         }
 
-        // Register hotkey 1: Injection hotkey (read from settings)
-        let injectionKeyCode = InjectionSettings.shared.injectionKeyCode
-        let injectionModifiers = InjectionSettings.shared.injectionModifiers
-        let injectionDisplay = InjectionSettings.shared.injectionDisplay
-
-        let pasteHotKeyID = EventHotKeyID(signature: OSType(0x464D4420), id: 1) // "FMD " signature
-        let pasteStatus = RegisterEventHotKey(
-            injectionKeyCode,
-            injectionModifiers,
-            pasteHotKeyID,
-            GetApplicationEventTarget(),
-            0,
-            &pasteHotkeyRef
-        )
-
-        if pasteStatus == noErr {
-            NSLog("FloatNote: Global hotkey \(injectionDisplay) registered successfully (Carbon API)")
-        } else {
-            NSLog("FloatNote: ERROR - Failed to register injection hotkey: \(pasteStatus)")
-        }
-
-        // Register hotkey 2: Toggle hotkey (read from settings)
+        // Register hotkey 1: Toggle hotkey (read from settings)
         let toggleKeyCode = InjectionSettings.shared.toggleKeyCode
         let toggleModifiers = InjectionSettings.shared.toggleModifiers
         let toggleDisplay = InjectionSettings.shared.toggleDisplay
 
-        let toggleHotKeyID = EventHotKeyID(signature: OSType(0x464D4420), id: 2) // "FMD " signature
+        let toggleHotKeyID = EventHotKeyID(signature: OSType(0x464D4420), id: 1) // "FMD " signature
         let toggleStatus = RegisterEventHotKey(
             toggleKeyCode,
             toggleModifiers,
@@ -4727,16 +5561,16 @@ class HotkeyManager {
         )
 
         if toggleStatus == noErr {
-            NSLog("FloatNote: Global hotkey \(toggleDisplay) registered successfully (Carbon API)")
+            NSLog("WispMark: Global hotkey \(toggleDisplay) registered successfully (Carbon API)")
         } else {
-            NSLog("FloatNote: ERROR - Failed to register toggle hotkey: \(toggleStatus)")
+            NSLog("WispMark: ERROR - Failed to register toggle hotkey: \(toggleStatus)")
         }
 
-        // Register hotkey 3: New Note hotkey (Cmd+N)
+        // Register hotkey 2: New Note hotkey (Cmd+N)
         let newNoteKeyCode: UInt32 = 45 // 'n' key
         let newNoteModifiers: UInt32 = UInt32(cmdKey) // Cmd modifier
 
-        let newNoteHotKeyID = EventHotKeyID(signature: OSType(0x464D4420), id: 3) // "FMD " signature
+        let newNoteHotKeyID = EventHotKeyID(signature: OSType(0x464D4420), id: 2) // "FMD " signature
         let newNoteStatus = RegisterEventHotKey(
             newNoteKeyCode,
             newNoteModifiers,
@@ -4747,142 +5581,40 @@ class HotkeyManager {
         )
 
         if newNoteStatus == noErr {
-            NSLog("FloatNote: Global hotkey Cmd+N registered successfully (Carbon API)")
+            NSLog("WispMark: Global hotkey Cmd+N registered successfully (Carbon API)")
         } else {
-            NSLog("FloatNote: ERROR - Failed to register new note hotkey: \(newNoteStatus)")
-        }
-
-        // Register hotkey 4: Cut and Paste hotkey (configurable, default Cmd+Opt+X)
-        let cutPasteKeyCodeSetting = InjectionSettings.shared.cutInjectKeyCode
-        let cutPasteModifiersSetting = InjectionSettings.shared.cutInjectModifiers
-
-        let cutPasteHotKeyID = EventHotKeyID(signature: OSType(0x464D4420), id: 4) // "FMD " signature
-        let cutPasteStatus = RegisterEventHotKey(
-            cutPasteKeyCodeSetting,
-            cutPasteModifiersSetting,
-            cutPasteHotKeyID,
-            GetApplicationEventTarget(),
-            0,
-            &cutPasteHotkeyRef
-        )
-
-        if cutPasteStatus == noErr {
-            NSLog("FloatNote: Global hotkey \(InjectionSettings.shared.cutInjectDisplay) registered successfully (Carbon API)")
-        } else {
-            NSLog("FloatNote: ERROR - Failed to register cut and paste hotkey: \(cutPasteStatus)")
+            NSLog("WispMark: ERROR - Failed to register new note hotkey: \(newNoteStatus)")
         }
     }
 
     func handleHotkey(id: UInt32) {
         if id == 1 {
-            handlePasteHotkey()
-        } else if id == 2 {
             handleToggleHotkey()
-        } else if id == 3 {
+        } else if id == 2 {
             handleNewNoteHotkey()
-        } else if id == 4 {
-            handleCutPasteHotkey()
-        }
-    }
-
-    func handlePasteHotkey() {
-        NSLog("FloatNote: Hotkey Opt+Cmd+I pressed!")
-        guard let appDelegate = NSApp.delegate as? AppDelegate,
-              let view = appDelegate.window.contentView as? MainView else {
-            NSLog("FloatNote: ERROR - Could not get MainView")
-            return
-        }
-
-        let rawContent = view.getSelectedTextOrContent()
-        let content = InjectionSettings.shared.processContent(rawContent)
-        NSLog("FloatNote: Content to paste: \(content.prefix(50))...")
-
-        // Visual feedback
-        DispatchQueue.main.async {
-            appDelegate.window.contentView?.layer?.backgroundColor = NSColor.white.cgColor
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.2
-                appDelegate.window.contentView?.animator().layer?.backgroundColor = NSColor.clear.cgColor
-            }
-        }
-
-        // Copy to clipboard
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(content, forType: .string)
-        NSLog("FloatNote: Content copied to clipboard")
-
-        // Use CGEvent to simulate Cmd+V - more reliable than AppleScript
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            // Check accessibility permission first
-            let trusted = AXIsProcessTrusted()
-            NSLog("FloatNote: Accessibility trusted: \(trusted)")
-
-            if !trusted {
-                NSLog("FloatNote: ERROR - Not trusted for accessibility. Please grant permission in System Settings → Privacy & Security → Accessibility")
-                // Show alert on main thread
-                DispatchQueue.main.async {
-                    let alert = NSAlert()
-                    alert.messageText = "Accessibility Permission Required"
-                    alert.informativeText = "FloatMD needs Accessibility permission to inject text. Please add it in System Settings → Privacy & Security → Accessibility"
-                    alert.addButton(withTitle: "Open Settings")
-                    alert.addButton(withTitle: "Cancel")
-                    if alert.runModal() == .alertFirstButtonReturn {
-                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                    }
-                }
-                return
-            }
-
-            NSLog("FloatNote: Simulating Cmd+V paste...")
-
-            // Create key down event for 'v' with command modifier
-            guard let source = CGEventSource(stateID: .hidSystemState) else {
-                NSLog("FloatNote: ERROR - Could not create CGEventSource")
-                return
-            }
-
-            // Key code 9 = 'v'
-            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true) else {
-                NSLog("FloatNote: ERROR - Could not create keyDown event")
-                return
-            }
-            keyDown.flags = .maskCommand
-            keyDown.post(tap: .cghidEventTap)
-            NSLog("FloatNote: keyDown posted")
-
-            // Key up event
-            guard let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false) else {
-                NSLog("FloatNote: ERROR - Could not create keyUp event")
-                return
-            }
-            keyUp.flags = .maskCommand
-            keyUp.post(tap: .cghidEventTap)
-
-            NSLog("FloatNote: Paste event posted successfully")
         }
     }
 
     func handleToggleHotkey() {
-        NSLog("FloatNote: Toggle hotkey pressed!")
+        NSLog("WispMark: Toggle hotkey pressed!")
         guard let appDelegate = NSApp.delegate as? AppDelegate else {
-            NSLog("FloatNote: ERROR - Could not get AppDelegate")
+            NSLog("WispMark: ERROR - Could not get AppDelegate")
             return
         }
 
         DispatchQueue.main.async {
             guard let window = appDelegate.window else {
-                NSLog("FloatNote: ERROR - Window is nil")
+                NSLog("WispMark: ERROR - Window is nil")
                 return
             }
 
             if window.isVisible && window.isKeyWindow {
                 // Window is visible and active - hide it
-                NSLog("FloatNote: Hiding window")
+                NSLog("WispMark: Hiding window")
                 window.orderOut(nil)
             } else {
                 // Window is hidden or not key - bring it back
-                NSLog("FloatNote: Showing and activating window")
+                NSLog("WispMark: Showing and activating window")
                 window.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
             }
@@ -4890,9 +5622,9 @@ class HotkeyManager {
     }
 
     func handleNewNoteHotkey() {
-        NSLog("FloatNote: Hotkey Cmd+N pressed!")
+        NSLog("WispMark: Hotkey Cmd+N pressed!")
         guard let appDelegate = NSApp.delegate as? AppDelegate else {
-            NSLog("FloatNote: ERROR - Could not get AppDelegate")
+            NSLog("WispMark: ERROR - Could not get AppDelegate")
             return
         }
 
@@ -4906,67 +5638,10 @@ class HotkeyManager {
             // Show and activate window
             appDelegate.window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
-            NSLog("FloatNote: New note created and window activated")
+            NSLog("WispMark: New note created and window activated")
         }
     }
 
-    func handleCutPasteHotkey() {
-        NSLog("FloatNote: Hotkey Cmd+Opt+X pressed!")
-        guard let appDelegate = NSApp.delegate as? AppDelegate,
-              let view = appDelegate.window.contentView as? MainView else {
-            NSLog("FloatNote: ERROR - Could not get MainView")
-            return
-        }
-
-        // Get the content to paste (selected or full)
-        let rawContent = view.getSelectedTextOrContent()
-        let content = InjectionSettings.shared.processContent(rawContent)
-        NSLog("FloatNote: Content to cut and paste: \(content.prefix(50))...")
-
-        // Visual feedback (yellow to indicate "cut" instead of just "paste")
-        DispatchQueue.main.async {
-            appDelegate.window.contentView?.layer?.backgroundColor = NSColor.yellow.cgColor
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.2
-                appDelegate.window.contentView?.animator().layer?.backgroundColor = NSColor.clear.cgColor
-            }
-        }
-
-        // Copy to clipboard
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(content, forType: .string)
-        NSLog("FloatNote: Content copied to clipboard")
-
-        // Use CGEvent to simulate Cmd+V - more reliable than AppleScript
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            NSLog("FloatNote: Simulating Cmd+V paste...")
-
-            // Create key down event for 'v' with command modifier
-            let source = CGEventSource(stateID: .hidSystemState)
-
-            // Key code 9 = 'v'
-            if let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true) {
-                keyDown.flags = .maskCommand
-                keyDown.post(tap: .cghidEventTap)
-            }
-
-            // Key up event
-            if let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false) {
-                keyUp.flags = .maskCommand
-                keyUp.post(tap: .cghidEventTap)
-            }
-
-            NSLog("FloatNote: Paste event posted")
-
-            // After pasting, delete the content from the note
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                NSLog("FloatNote: Deleting content from note")
-                view.deleteSelectedTextOrClearContent()
-                NSLog("FloatNote: Content deleted from note and saved")
-            }
-        }
-    }
 }
 
 // MARK: - Main Entry Point
