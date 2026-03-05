@@ -3,3 +3,5 @@ FloatMD
 *.swp
 *.swo
 .claude/
+GoogleService-Info.plist
+firebase-debug.log

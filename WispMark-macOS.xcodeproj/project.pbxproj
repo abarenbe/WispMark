@@ -7,15 +7,31 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		30CA126D18F4A4CBFCA86A5B /* FirebaseCore in Frameworks */ = {isa = PBXBuildFile; productRef = 57F5B647B22D698CF852184E /* FirebaseCore */; };
 		74CA7F7225A2B191DAAC2B41 /* StoreAppIcon.icns in Resources */ = {isa = PBXBuildFile; fileRef = 9540E9431011BDA796BD39F6 /* StoreAppIcon.icns */; };
+		B411DA391323C383477D5018 /* FirebaseFirestore in Frameworks */ = {isa = PBXBuildFile; productRef = A820B273117D304204CC94E0 /* FirebaseFirestore */; };
+		D2E266CD1125BBFD1BE26DCB /* FirestoreSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = 627A29343C15D019920456C1 /* FirestoreSync.swift */; };
 		F8C6536C3C09C80737853307 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = A70467703C9F47B66FFF43AE /* main.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		627A29343C15D019920456C1 /* FirestoreSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirestoreSync.swift; sourceTree = "<group>"; };
 		9540E9431011BDA796BD39F6 /* StoreAppIcon.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = StoreAppIcon.icns; sourceTree = "<group>"; };
 		A70467703C9F47B66FFF43AE /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		A94A25F427319A295C162100 /* WispMark.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WispMark.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		AD23B5DF1E4FCA077B99F683 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				30CA126D18F4A4CBFCA86A5B /* FirebaseCore in Frameworks */,
+				B411DA391323C383477D5018 /* FirebaseFirestore in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
 		289D714024028253E1BB7D31 /* Products */ = {
@@ -29,6 +45,7 @@
 		62D8290DE05415747261E51D = {
 			isa = PBXGroup;
 			children = (
+				627A29343C15D019920456C1 /* FirestoreSync.swift */,
 				A70467703C9F47B66FFF43AE /* main.swift */,
 				9540E9431011BDA796BD39F6 /* StoreAppIcon.icns */,
 				289D714024028253E1BB7D31 /* Products */,
@@ -44,6 +61,7 @@
 			buildPhases = (
 				7EA933E313255D576FDF052D /* Sources */,
 				E6D79CC221EA840E58FA0B47 /* Resources */,
+				AD23B5DF1E4FCA077B99F683 /* Frameworks */,
 			);
 			buildRules = (
 			);
@@ -51,6 +69,8 @@
 			);
 			name = WispMark;
 			packageProductDependencies = (
+				57F5B647B22D698CF852184E /* FirebaseCore */,
+				A820B273117D304204CC94E0 /* FirebaseFirestore */,
 			);
 			productName = WispMark;
 			productReference = A94A25F427319A295C162100 /* WispMark.app */;
@@ -80,6 +100,9 @@
 			);
 			mainGroup = 62D8290DE05415747261E51D;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				3E27214602376E02F75B3CF3 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */,
+			);
 			preferredProjectObjectVersion = 77;
 			projectDirPath = "";
 			projectRoot = "";
@@ -105,6 +128,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D2E266CD1125BBFD1BE26DCB /* FirestoreSync.swift in Sources */,
 				F8C6536C3C09C80737853307 /* main.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -297,6 +321,30 @@
 			defaultConfigurationName = Debug;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		3E27214602376E02F75B3CF3 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/firebase/firebase-ios-sdk";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 11.7.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		57F5B647B22D698CF852184E /* FirebaseCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 3E27214602376E02F75B3CF3 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseCore;
+		};
+		A820B273117D304204CC94E0 /* FirebaseFirestore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 3E27214602376E02F75B3CF3 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseFirestore;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = D196854C32E4EF147C732996 /* Project object */;
 }

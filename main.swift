@@ -1,5 +1,6 @@
 import Cocoa
 import Carbon
+import Darwin
 
 // MARK: - Note Model
 struct Note: Codable, Identifiable {
@@ -84,12 +85,19 @@ class NotesManager {
     private let legacyDocumentsDirectory: URL
     private let corruptedDirectory: URL
     private let trashDirectory: URL
+    private var noteFileByID: [UUID: URL] = [:]
+    private var noteIDByPath: [String: UUID] = [:]
+    private var storageDirectoryFD: CInt = -1
+    private var storageDirectoryMonitor: DispatchSourceFileSystemObject?
+    private var pendingExternalReload: DispatchWorkItem?
+    private var suppressExternalReloadUntil = Date.distantPast
     
     var notes: [Note] = []
     var notesDirectoryURL: URL { storageDirectory }
     var corruptedNotesDirectoryURL: URL { corruptedDirectory }
     var trashNotesDirectoryURL: URL { trashDirectory }
     private var quarantinedCorruptedFiles: [String] = []
+    private var isApplyingRemoteSyncChange = false
     private struct MarkdownNoteMetadata: Codable {
         let id: UUID
         let createdAt: Date
@@ -130,6 +138,13 @@ class NotesManager {
     }
 
     func noteFileURL(for noteID: UUID) -> URL {
+        if let indexedURL = noteFileByID[noteID] {
+            return indexedURL
+        }
+        if let scannedURL = findNoteFileOnDisk(noteID: noteID) {
+            registerNoteFile(noteID: noteID, fileURL: scannedURL)
+            return scannedURL
+        }
         let markdownURL = markdownFileURL(for: noteID)
         if FileManager.default.fileExists(atPath: markdownURL.path) {
             return markdownURL
@@ -241,6 +256,14 @@ class NotesManager {
 
         // Restore active workspace
         activeWorkspace = UserDefaults.standard.string(forKey: activeWorkspaceKey)
+
+        normalizeMarkdownFileNamesIfNeeded()
+        startStorageDirectoryMonitor()
+        startFirestoreSyncIfConfigured()
+    }
+
+    deinit {
+        stopStorageDirectoryMonitor()
     }
 
     private func ensureReadmeNote() {
@@ -383,6 +406,90 @@ WispMark supports Markdown:
         defaults.set(true, forKey: legacyDocumentsMigrationKey)
     }
 
+    private func normalizeMarkdownFileNamesIfNeeded() {
+        for note in notes {
+            guard let currentURL = noteFileByID[note.id] else { continue }
+            let preferredCurrent = currentURL.pathExtension.lowercased() == "md" ? currentURL : nil
+            let preferredURL = preferredMarkdownFileURL(for: note, currentURL: preferredCurrent)
+
+            let needsNormalization =
+                currentURL.pathExtension.lowercased() != "md"
+                || normalizedPath(currentURL) != normalizedPath(preferredURL)
+
+            if needsNormalization {
+                save(note: note)
+            }
+        }
+    }
+
+    private func startStorageDirectoryMonitor() {
+        stopStorageDirectoryMonitor()
+
+        let fd = open(storageDirectory.path, O_EVTONLY)
+        guard fd >= 0 else {
+            NSLog("WispMark: failed to monitor notes directory at %@", storageDirectory.path)
+            return
+        }
+
+        storageDirectoryFD = fd
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .delete, .rename, .extend, .attrib],
+            queue: DispatchQueue.global(qos: .utility)
+        )
+
+        source.setEventHandler { [weak self] in
+            self?.handleStorageDirectoryEvent()
+        }
+        source.setCancelHandler { [weak self] in
+            guard let self else { return }
+            if self.storageDirectoryFD >= 0 {
+                close(self.storageDirectoryFD)
+                self.storageDirectoryFD = -1
+            }
+        }
+
+        storageDirectoryMonitor = source
+        source.resume()
+    }
+
+    private func stopStorageDirectoryMonitor() {
+        pendingExternalReload?.cancel()
+        pendingExternalReload = nil
+        storageDirectoryMonitor?.cancel()
+        storageDirectoryMonitor = nil
+        if storageDirectoryFD >= 0 {
+            close(storageDirectoryFD)
+            storageDirectoryFD = -1
+        }
+    }
+
+    private func handleStorageDirectoryEvent() {
+        guard Date() >= suppressExternalReloadUntil else { return }
+
+        pendingExternalReload?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.reloadFromDiskDueToExternalChanges()
+        }
+        pendingExternalReload = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
+    }
+
+    private func reloadFromDiskDueToExternalChanges() {
+        guard Date() >= suppressExternalReloadUntil else { return }
+
+        let previousActiveNoteID = activeNoteId
+        load()
+
+        if let previousActiveNoteID, notes.contains(where: { $0.id == previousActiveNoteID }) {
+            activeNoteId = previousActiveNoteID
+        } else {
+            activeNoteId = notes.first?.id
+        }
+
+        NotificationCenter.default.post(name: .notesDidReloadFromDisk, object: nil)
+    }
+
     func createNote() -> Note {
         let note = Note(content: "")
         notes.insert(note, at: 0)
@@ -397,25 +504,30 @@ WispMark supports Markdown:
 
         // Soft-delete file by moving it to local trash.
         let fileManager = FileManager.default
-        let markdownURL = markdownFileURL(for: note.id)
-        let legacyJSONURL = legacyJSONFileURL(for: note.id)
-        let sourceURL: URL? = fileManager.fileExists(atPath: markdownURL.path) ? markdownURL :
-            (fileManager.fileExists(atPath: legacyJSONURL.path) ? legacyJSONURL : nil)
+        let resolvedURL = noteFileURL(for: note.id)
+        let sourceURL: URL? = fileManager.fileExists(atPath: resolvedURL.path) ? resolvedURL : nil
 
         if let fileURL = sourceURL {
             let trashURL = makeTrashURL(for: note, pathExtension: fileURL.pathExtension)
             do {
+                suppressExternalReload()
                 try fileManager.moveItem(at: fileURL, to: trashURL)
             } catch {
                 NSLog("Error moving note to trash: %@", error.localizedDescription)
                 // Fallback so deletion still succeeds if trash move fails.
+                suppressExternalReload()
                 try? fileManager.removeItem(at: fileURL)
             }
         }
+        unregisterNoteFile(noteID: note.id)
 
         notes.removeAll { $0.id == note.id }
         if activeNoteId == note.id {
             activeNoteId = notes.first?.id
+        }
+
+        if !isApplyingRemoteSyncChange {
+            FirestoreSyncManager.shared.markLocalDeletion(noteID: note.id, modifiedAt: Date())
         }
     }
 
@@ -619,6 +731,107 @@ WispMark supports Markdown:
         save(note: notes[index])
     }
 
+    private func startFirestoreSyncIfConfigured() {
+        FirestoreSyncManager.shared.start(
+            notesProvider: { [weak self] in
+                self?.notes ?? []
+            },
+            applyRemoteUpsert: { [weak self] note in
+                self?.applyRemoteUpsert(note)
+            },
+            applyRemoteDelete: { [weak self] noteID, modifiedAt in
+                self?.applyRemoteDeletion(noteID: noteID, modifiedAt: modifiedAt)
+            }
+        )
+    }
+
+    private func applyRemoteUpsert(_ note: Note) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.applyRemoteUpsert(note)
+            }
+            return
+        }
+
+        if let index = notes.firstIndex(where: { $0.id == note.id }) {
+            if notes[index].modifiedAt >= note.modifiedAt {
+                return
+            }
+
+            withRemoteSyncChangeApplied {
+                notes[index] = note
+                save(note: note)
+            }
+        } else {
+            withRemoteSyncChangeApplied {
+                notes.insert(note, at: 0)
+                save(note: note)
+                if activeNoteId == nil {
+                    activeNoteId = note.id
+                }
+            }
+        }
+
+        notes.sort { $0.modifiedAt > $1.modifiedAt }
+    }
+
+    private func applyRemoteDeletion(noteID: UUID, modifiedAt: Date) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.applyRemoteDeletion(noteID: noteID, modifiedAt: modifiedAt)
+            }
+            return
+        }
+
+        // Keep the built-in guide note stable for every install.
+        if noteID == readmeNoteId {
+            return
+        }
+
+        guard let index = notes.firstIndex(where: { $0.id == noteID }) else {
+            withRemoteSyncChangeApplied {
+                removeNoteFilesPermanently(noteID: noteID)
+            }
+            return
+        }
+
+        // Last-write-wins: ignore stale delete events.
+        if notes[index].modifiedAt > modifiedAt {
+            return
+        }
+
+        withRemoteSyncChangeApplied {
+            removeNoteFilesPermanently(noteID: noteID)
+            notes.remove(at: index)
+
+            if activeNoteId == noteID {
+                activeNoteId = notes.first?.id
+            }
+        }
+    }
+
+    private func withRemoteSyncChangeApplied(_ block: () -> Void) {
+        let wasApplying = isApplyingRemoteSyncChange
+        isApplyingRemoteSyncChange = true
+        block()
+        isApplyingRemoteSyncChange = wasApplying
+    }
+
+    private func removeNoteFilesPermanently(noteID: UUID) {
+        let fileManager = FileManager.default
+        let markdownURL = noteFileURL(for: noteID)
+        let legacyJSONURL = legacyJSONFileURL(for: noteID)
+
+        suppressExternalReload()
+        if fileManager.fileExists(atPath: markdownURL.path) {
+            try? fileManager.removeItem(at: markdownURL)
+        }
+        if fileManager.fileExists(atPath: legacyJSONURL.path) {
+            try? fileManager.removeItem(at: legacyJSONURL)
+        }
+        unregisterNoteFile(noteID: noteID)
+    }
+
     func takeCorruptedFileReport() -> [String] {
         let report = quarantinedCorruptedFiles
         quarantinedCorruptedFiles = []
@@ -633,9 +846,100 @@ WispMark supports Markdown:
         storageDirectory.appendingPathComponent("\(noteID.uuidString).json")
     }
 
+    private func normalizedPath(_ url: URL) -> String {
+        url.standardizedFileURL.path
+    }
+
+    private func registerNoteFile(noteID: UUID, fileURL: URL) {
+        if let existing = noteFileByID[noteID] {
+            noteIDByPath.removeValue(forKey: normalizedPath(existing))
+        }
+        noteFileByID[noteID] = fileURL
+        noteIDByPath[normalizedPath(fileURL)] = noteID
+    }
+
+    private func unregisterNoteFile(noteID: UUID) {
+        if let existing = noteFileByID[noteID] {
+            noteIDByPath.removeValue(forKey: normalizedPath(existing))
+        }
+        noteFileByID.removeValue(forKey: noteID)
+    }
+
+    private func clearNoteFileIndex() {
+        noteFileByID.removeAll()
+        noteIDByPath.removeAll()
+    }
+
+    private func sanitizedFileStem(from title: String) -> String {
+        let invalid = CharacterSet(charactersIn: "/:\\?%*|\"<>")
+            .union(.newlines)
+            .union(.controlCharacters)
+        var cleaned = title.components(separatedBy: invalid).joined(separator: " ")
+        cleaned = cleaned.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.isEmpty {
+            cleaned = "Untitled"
+        }
+        return String(cleaned.prefix(64))
+    }
+
+    private func canUse(fileURL: URL, for noteID: UUID, currentURL: URL?) -> Bool {
+        if let currentURL, normalizedPath(currentURL) == normalizedPath(fileURL) {
+            return true
+        }
+        let path = normalizedPath(fileURL)
+        if let existingID = noteIDByPath[path] {
+            return existingID == noteID
+        }
+        return !FileManager.default.fileExists(atPath: fileURL.path)
+    }
+
+    private func preferredMarkdownFileURL(for note: Note, currentURL: URL?) -> URL {
+        let stem = sanitizedFileStem(from: note.title)
+        let primary = storageDirectory.appendingPathComponent("\(stem).md")
+        if canUse(fileURL: primary, for: note.id, currentURL: currentURL) {
+            return primary
+        }
+
+        let shortCode = note.id.uuidString.replacingOccurrences(of: "-", with: "").prefix(6).lowercased()
+        return storageDirectory.appendingPathComponent("\(stem)-\(shortCode).md")
+    }
+
+    private func suppressExternalReload(duration: TimeInterval = 0.7) {
+        suppressExternalReloadUntil = Date().addingTimeInterval(duration)
+    }
+
     private func isNoteFile(_ file: URL) -> Bool {
         let ext = file.pathExtension.lowercased()
         return ext == "md" || ext == "json"
+    }
+
+    private func findNoteFileOnDisk(noteID: UUID) -> URL? {
+        guard let files = try? FileManager.default.contentsOfDirectory(at: storageDirectory, includingPropertiesForKeys: nil) else {
+            return nil
+        }
+
+        for file in files where isNoteFile(file) {
+            let stem = file.deletingPathExtension().lastPathComponent
+            if stem == noteID.uuidString {
+                return file
+            }
+
+            guard file.pathExtension.lowercased() == "md",
+                  let data = try? Data(contentsOf: file),
+                  let markdown = String(data: data, encoding: .utf8),
+                  let frontMatter = parseFrontMatter(from: markdown),
+                  let metadataData = frontMatter.metadataJSON.data(using: .utf8),
+                  let metadata = try? JSONDecoder().decode(MarkdownNoteMetadata.self, from: metadataData) else {
+                continue
+            }
+
+            if metadata.id == noteID {
+                return file
+            }
+        }
+
+        return nil
     }
 
     private func noteIDFromFileName(_ fileURL: URL) -> UUID? {
@@ -749,33 +1053,70 @@ WispMark supports Markdown:
         return true
     }
 
-    private func migrateJSONFileToMarkdownIfNeeded(_ fileURL: URL, note: Note) {
-        guard fileURL.pathExtension.lowercased() == "json" else { return }
+    private func migrateJSONFileToMarkdownIfNeeded(_ fileURL: URL, note: Note) -> URL {
+        guard fileURL.pathExtension.lowercased() == "json" else { return fileURL }
         let fileManager = FileManager.default
-        let markdownURL = markdownFileURL(for: note.id)
+        let markdownURL = preferredMarkdownFileURL(for: note, currentURL: nil)
 
         if fileManager.fileExists(atPath: markdownURL.path) {
+            suppressExternalReload()
             try? fileManager.removeItem(at: fileURL)
-            return
+            return markdownURL
         }
 
         do {
             let markdown = try markdownString(for: note)
+            suppressExternalReload()
             try markdown.write(to: markdownURL, atomically: true, encoding: .utf8)
+            suppressExternalReload()
             try? fileManager.removeItem(at: fileURL)
+            return markdownURL
         } catch {
             NSLog("Error migrating JSON note %@ to markdown: %@", fileURL.lastPathComponent, error.localizedDescription)
+            return fileURL
         }
     }
 
     private func save(note: Note) {
-        let fileURL = markdownFileURL(for: note.id)
+        let fileManager = FileManager.default
+        let currentURL = noteFileByID[note.id]
+        var fileURL = preferredMarkdownFileURL(for: note, currentURL: currentURL)
+
+        if let currentURL, normalizedPath(currentURL) != normalizedPath(fileURL), fileManager.fileExists(atPath: currentURL.path) {
+            do {
+                if fileManager.fileExists(atPath: fileURL.path), noteIDByPath[normalizedPath(fileURL)] == note.id {
+                    suppressExternalReload()
+                    try? fileManager.removeItem(at: fileURL)
+                }
+                suppressExternalReload()
+                try fileManager.moveItem(at: currentURL, to: fileURL)
+            } catch {
+                NSLog("Error renaming note file %@ -> %@: %@", currentURL.lastPathComponent, fileURL.lastPathComponent, error.localizedDescription)
+                fileURL = currentURL
+            }
+        }
+
         do {
             let markdown = try markdownString(for: note)
+            suppressExternalReload()
             try markdown.write(to: fileURL, atomically: true, encoding: .utf8)
             let legacyJSONURL = legacyJSONFileURL(for: note.id)
-            if FileManager.default.fileExists(atPath: legacyJSONURL.path) {
-                try? FileManager.default.removeItem(at: legacyJSONURL)
+            if fileManager.fileExists(atPath: legacyJSONURL.path) {
+                suppressExternalReload()
+                try? fileManager.removeItem(at: legacyJSONURL)
+            }
+
+            let legacyMarkdownURL = markdownFileURL(for: note.id)
+            if normalizedPath(legacyMarkdownURL) != normalizedPath(fileURL),
+               fileManager.fileExists(atPath: legacyMarkdownURL.path) {
+                suppressExternalReload()
+                try? fileManager.removeItem(at: legacyMarkdownURL)
+            }
+
+            registerNoteFile(noteID: note.id, fileURL: fileURL)
+
+            if !isApplyingRemoteSyncChange {
+                FirestoreSyncManager.shared.upsertLocalNote(note)
             }
         } catch {
             NSLog("Error saving note: %@", error.localizedDescription)
@@ -785,9 +1126,11 @@ WispMark supports Markdown:
     private func load() {
         notes = []
         quarantinedCorruptedFiles = []
+        clearNoteFileIndex()
         guard let files = try? FileManager.default.contentsOfDirectory(at: storageDirectory, includingPropertiesForKeys: nil) else { return }
 
         var notesById: [UUID: Note] = [:]
+        var filesById: [UUID: URL] = [:]
 
         for file in files where isNoteFile(file) {
             do {
@@ -796,15 +1139,18 @@ WispMark supports Markdown:
                     save(note: note)
                 }
 
+                let migratedFile = migrateJSONFileToMarkdownIfNeeded(file, note: note)
+                let resolvedFile = noteFileByID[note.id] ?? migratedFile
+
                 if let existing = notesById[note.id] {
                     if note.modifiedAt >= existing.modifiedAt {
                         notesById[note.id] = note
+                        filesById[note.id] = resolvedFile
                     }
                 } else {
                     notesById[note.id] = note
+                    filesById[note.id] = resolvedFile
                 }
-
-                migrateJSONFileToMarkdownIfNeeded(file, note: note)
             } catch {
                 quarantineCorruptedNoteFile(file, error: error)
             }
@@ -812,6 +1158,10 @@ WispMark supports Markdown:
 
         notes = Array(notesById.values)
         notes.sort { $0.modifiedAt > $1.modifiedAt }
+        clearNoteFileIndex()
+        for (noteID, fileURL) in filesById {
+            registerNoteFile(noteID: noteID, fileURL: fileURL)
+        }
     }
 
     private func quarantineCorruptedNoteFile(_ file: URL, error readError: Error) {
@@ -1409,6 +1759,7 @@ class ThemeManager {
 
 extension Notification.Name {
     static let themeDidChange = Notification.Name("themeDidChange")
+    static let notesDidReloadFromDisk = Notification.Name("notesDidReloadFromDisk")
 }
 
 // MARK: - Floating Panel
@@ -1719,6 +2070,7 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
         setupUI()
         loadContent()
         NotificationCenter.default.addObserver(self, selector: #selector(themeDidChange), name: .themeDidChange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(notesDidReloadFromDisk), name: .notesDidReloadFromDisk, object: nil)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -1730,6 +2082,23 @@ class MainView: NSView, NSTextViewDelegate, NSTextStorageDelegate {
     @objc private func themeDidChange() {
         applyTheme()
         applyMarkdownFormatting()
+    }
+
+    @objc private func notesDidReloadFromDisk() {
+        let selectedRange = textView.selectedRange()
+        let wasFirstResponder = window?.firstResponder === textView
+
+        loadContent()
+        noteBrowserView?.reloadNotes()
+
+        let maxLength = (textView.string as NSString).length
+        let clampedLocation = min(selectedRange.location, maxLength)
+        let clampedLength = min(selectedRange.length, max(0, maxLength - clampedLocation))
+        textView.setSelectedRange(NSRange(location: clampedLocation, length: clampedLength))
+
+        if wasFirstResponder {
+            window?.makeFirstResponder(textView)
+        }
     }
 
     private func applyTheme() {
@@ -4762,6 +5131,7 @@ class NoteBrowserView: NSView, NSTextFieldDelegate {
         setupUI()
         reloadNotes()
         NotificationCenter.default.addObserver(self, selector: #selector(themeDidChange), name: .themeDidChange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(notesDidReloadFromDisk), name: .notesDidReloadFromDisk, object: nil)
     }
 
     @objc private func themeDidChange() {
@@ -4770,7 +5140,15 @@ class NoteBrowserView: NSView, NSTextFieldDelegate {
         tableView.reloadData()
     }
 
+    @objc private func notesDidReloadFromDisk() {
+        reloadNotes()
+    }
+
     required init?(coder: NSCoder) { fatalError() }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
 
     private func setupUI() {
         wantsLayer = true

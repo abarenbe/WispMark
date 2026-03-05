@@ -1,0 +1,16 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Prototype sync rules for WispMark.
+    // Access is gated by possession of a high-entropy space ID.
+    // For production, move to authenticated, user-bound rules.
+    match /syncSpaces/{spaceId}/notes/{noteId} {
+      allow read, write: if spaceId.matches('^[A-Za-z0-9_-]{20,}$')
+                         && noteId.matches('^[0-9a-fA-F-]{36}$');
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

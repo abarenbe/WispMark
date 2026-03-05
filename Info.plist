@@ -24,6 +24,20 @@
     <string>public.app-category.productivity</string>
     <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
+    <key>WispMarkFirestoreSyncEnabled</key>
+    <false/>
+    <key>WispMarkFirestoreSyncSpaceID</key>
+    <string></string>
+    <key>WispMarkFirebaseAPIKey</key>
+    <string></string>
+    <key>WispMarkFirebaseAppID</key>
+    <string></string>
+    <key>WispMarkFirebaseProjectID</key>
+    <string></string>
+    <key>WispMarkFirebaseSenderID</key>
+    <string></string>
+    <key>WispMarkFirebaseStorageBucket</key>
+    <string></string>
     <key>LSUIElement</key>
     <true/>
     <key>NSHighResolutionCapable</key>
