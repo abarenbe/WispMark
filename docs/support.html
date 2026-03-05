@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WispMark Support</title>
+  <meta name="description" content="Support for WispMark">
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --card: #ffffff;
+      --text: #172026;
+      --muted: #4f5b66;
+      --border: #dbe3ea;
+      --accent: #116dff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 28px 16px 44px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 24px;
+      box-shadow: 0 8px 22px rgba(30, 50, 80, 0.06);
+    }
+    h1 { margin: 0 0 10px; font-size: 30px; }
+    h2 { margin: 22px 0 8px; font-size: 19px; }
+    p, li { color: var(--muted); line-height: 1.55; }
+    a { color: var(--accent); }
+    code { background: #eef3fb; padding: 2px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card">
+      <h1>WispMark Support</h1>
+      <p>If you need help with WispMark, use the options below.</p>
+
+      <h2>Contact</h2>
+      <p>Open a support issue on GitHub:<br>
+      <a href="https://github.com/abarenbe/WispMark/issues/new/choose">https://github.com/abarenbe/WispMark/issues/new/choose</a></p>
+
+      <h2>Include this information</h2>
+      <ul>
+        <li>macOS version</li>
+        <li>WispMark version and build (shown in app menu)</li>
+        <li>Steps to reproduce</li>
+        <li>Screenshot if relevant</li>
+      </ul>
+
+      <h2>Data Location</h2>
+      <p>WispMark stores notes locally on your Mac. In current local builds, notes are stored in:
+      <br><code>~/Library/Application Support/WispMark/Notes/</code></p>
+
+      <p><a href="index.html">Back to WispMark</a></p>
+    </section>
+  </main>
+</body>
+</html>
