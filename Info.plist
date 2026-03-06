@@ -29,15 +29,15 @@
     <key>WispMarkFirestoreSyncSpaceID</key>
     <string></string>
     <key>WispMarkFirebaseAPIKey</key>
-    <string></string>
+    <string>AIzaSyDSFWZ-rgBJyr3l8HKeZesDKx8KYpso0DU</string>
     <key>WispMarkFirebaseAppID</key>
-    <string></string>
+    <string>1:327928388164:ios:ae575cd6e86e5e04b27a11</string>
     <key>WispMarkFirebaseProjectID</key>
-    <string></string>
+    <string>wispmark-abarenbe-20260305</string>
     <key>WispMarkFirebaseSenderID</key>
-    <string></string>
+    <string>327928388164</string>
     <key>WispMarkFirebaseStorageBucket</key>
-    <string></string>
+    <string>wispmark-abarenbe-20260305.firebasestorage.app</string>
     <key>LSUIElement</key>
     <true/>
     <key>NSHighResolutionCapable</key>

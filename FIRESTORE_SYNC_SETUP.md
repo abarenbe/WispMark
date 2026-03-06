@@ -33,11 +33,12 @@ Preferred path:
 1. Build and launch WispMark.
 2. Open Settings.
 3. Click `Configure Firestore Sync...`
-4. Import `GoogleService-Info.plist`
-5. Generate or paste a long `Sync Space ID`
-6. Enable sync and save
+4. Generate or paste a long `Sync Space ID`
+5. Enable sync and save
 
 Use the same `Sync Space ID` on every Mac you want to sync.
+
+`GoogleService-Info.plist` is now optional because the WispMark Firebase project is embedded in `Info.plist`. Importing a plist is only needed if you want to override the built-in Firebase project on a specific Mac.
 
 Manual fallback:
 
