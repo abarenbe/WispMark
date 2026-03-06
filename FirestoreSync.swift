@@ -56,6 +56,7 @@ final class FirestoreSyncManager {
 
     private var hasBootstrappedLocalUpload = false
     private var started = false
+    private var lastErrorMessage: String?
 
     private let deviceIDDefaultsKey = "WispMark.Sync.DeviceID"
     private lazy var deviceID: String = {
@@ -131,6 +132,9 @@ final class FirestoreSyncManager {
         if firebaseConfigurationSource() == .missing {
             return "Import GoogleService-Info.plist or add Firebase defaults"
         }
+        if let lastErrorMessage, !lastErrorMessage.isEmpty {
+            return "Sync error: \(lastErrorMessage)"
+        }
         if started {
             return "Sync running for space \(settings.spaceID)"
         }
@@ -173,6 +177,7 @@ final class FirestoreSyncManager {
             return
         }
 
+        lastErrorMessage = nil
         self.notesProvider = notesProvider
         self.applyRemoteUpsert = applyRemoteUpsert
         self.applyRemoteDelete = applyRemoteDelete
@@ -200,6 +205,7 @@ final class FirestoreSyncManager {
 #endif
         started = false
         hasBootstrappedLocalUpload = false
+        lastErrorMessage = nil
         notesProvider = nil
         applyRemoteUpsert = nil
         applyRemoteDelete = nil
@@ -224,7 +230,10 @@ final class FirestoreSyncManager {
 
         notesCollection.document(note.id.uuidString).setData(payload, merge: true) { error in
             if let error {
+                self.lastErrorMessage = error.localizedDescription
                 NSLog("WispMark Sync: failed to upsert note %@: %@", note.id.uuidString, error.localizedDescription)
+            } else {
+                self.lastErrorMessage = nil
             }
         }
 #else
@@ -246,7 +255,10 @@ final class FirestoreSyncManager {
 
         notesCollection.document(noteID.uuidString).setData(payload, merge: true) { error in
             if let error {
+                self.lastErrorMessage = error.localizedDescription
                 NSLog("WispMark Sync: failed to mark delete %@: %@", noteID.uuidString, error.localizedDescription)
+            } else {
+                self.lastErrorMessage = nil
             }
         }
 #else
@@ -362,11 +374,13 @@ private extension FirestoreSyncManager {
             guard let self else { return }
 
             if let error {
+                self.lastErrorMessage = error.localizedDescription
                 NSLog("WispMark Sync: listener error: %@", error.localizedDescription)
                 return
             }
 
             guard let snapshot else { return }
+            self.lastErrorMessage = nil
 
             let remoteChanges = snapshot.documents.compactMap { self.decodeRemoteChange(from: $0) }
 

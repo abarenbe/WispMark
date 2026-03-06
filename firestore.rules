@@ -4,9 +4,15 @@ service cloud.firestore {
     // Prototype sync rules for WispMark.
     // Access is gated by possession of a high-entropy space ID.
     // For production, move to authenticated, user-bound rules.
+    function validSpaceId(spaceId) {
+      return spaceId.matches('^[A-Za-z0-9_-]{20,}$');
+    }
+
     match /syncSpaces/{spaceId}/notes/{noteId} {
-      allow read, write: if spaceId.matches('^[A-Za-z0-9_-]{20,}$')
-                         && noteId.matches('^[0-9a-fA-F-]{36}$');
+      // Collection listeners are list queries, so they cannot depend on noteId.
+      allow list: if validSpaceId(spaceId);
+      allow get, create, update, delete: if validSpaceId(spaceId)
+                                         && noteId.matches('^[0-9a-fA-F-]{36}$');
     }
 
     match /{document=**} {
