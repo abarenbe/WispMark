@@ -5,3 +5,6 @@ FloatMD
 .claude/
 GoogleService-Info.plist
 firebase-debug.log
+build/DerivedData/
+build/Install/
+firepit-log.txt

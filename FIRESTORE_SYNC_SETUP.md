@@ -28,7 +28,20 @@ This deploys:
 
 ## 4) Configure WispMark sync locally
 
-You can configure Firebase values without editing tracked files:
+Preferred path:
+
+1. Build and launch WispMark.
+2. Open Settings.
+3. Click `Configure Firestore Sync...`
+4. Import `GoogleService-Info.plist`
+5. Generate or paste a long `Sync Space ID`
+6. Enable sync and save
+
+Use the same `Sync Space ID` on every Mac you want to sync.
+
+Manual fallback:
+
+You can still configure Firebase values without editing tracked files:
 
 ```bash
 defaults write com.andybarenberg.WispMark WispMark.Sync.FirebaseAppID "1:1234567890:ios:abcdef123456"
@@ -40,8 +53,6 @@ defaults write com.andybarenberg.WispMark WispMark.Sync.FirebaseStorageBucket "y
 defaults write com.andybarenberg.WispMark WispMark.Sync.Enabled -bool true
 defaults write com.andybarenberg.WispMark WispMark.Sync.SpaceID "YOUR_LONG_RANDOM_SYNC_SPACE_ID"
 ```
-
-Use the same `WispMark.Sync.SpaceID` on every Mac you want to sync.
 
 ## 5) Build and run
 

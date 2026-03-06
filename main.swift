@@ -745,6 +745,45 @@ WispMark supports Markdown:
         )
     }
 
+    func currentSyncSettings() -> FirestoreSyncSettings {
+        FirestoreSyncSettings.current()
+    }
+
+    func generateSyncSpaceID() -> String {
+        FirestoreSyncSettings.generateSpaceID()
+    }
+
+    func saveSyncSettings(enabled: Bool, spaceID: String) {
+        FirestoreSyncSettings.persist(enabled: enabled, spaceID: spaceID)
+        refreshFirestoreSyncConfiguration()
+    }
+
+    func refreshFirestoreSyncConfiguration() {
+        FirestoreSyncManager.shared.stop()
+        startFirestoreSyncIfConfigured()
+    }
+
+    func importSyncGoogleServiceInfo(from sourceURL: URL) throws {
+        try FirestoreSyncManager.shared.importGoogleServiceInfo(from: sourceURL)
+        refreshFirestoreSyncConfiguration()
+    }
+
+    func syncStatusDescription() -> String {
+        FirestoreSyncManager.shared.statusDescription()
+    }
+
+    func syncConfigurationSourceDescription() -> String {
+        FirestoreSyncManager.shared.configurationSourceDescription()
+    }
+
+    func syncRestartNotice() -> String? {
+        FirestoreSyncManager.shared.restartNoticeIfNeeded()
+    }
+
+    var importedSyncGoogleServiceInfoURL: URL {
+        FirestoreSyncManager.shared.importedGoogleServiceInfoURL
+    }
+
     private func applyRemoteUpsert(_ note: Note) {
         guard Thread.isMainThread else {
             DispatchQueue.main.async { [weak self] in
@@ -1614,6 +1653,15 @@ struct Theme {
     let workspaceTagBackground: NSColor
     let cursor: NSColor
     let visualEffectMaterial: NSVisualEffectView.Material
+
+    var controlAppearance: NSAppearance? {
+        switch name {
+        case "Light", "Sepia":
+            return NSAppearance(named: .aqua)
+        default:
+            return NSAppearance(named: .darkAqua)
+        }
+    }
 
     static let dark = Theme(
         name: "Dark",
@@ -4879,6 +4927,8 @@ class SettingsView: NSView {
     private var workspaceLabel: NSTextField!
     private var defaultEditorLabel: NSTextField!
     private var defaultEditorPopup: NSPopUpButton!
+    private var syncLabel: NSTextField!
+    private var syncSettingsButton: NSButton!
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -4890,6 +4940,7 @@ class SettingsView: NSView {
     private func setupUI() {
         wantsLayer = true
         layer?.backgroundColor = ThemeManager.shared.currentTheme.background.cgColor
+        appearance = ThemeManager.shared.currentTheme.controlAppearance
 
         // Title
         titleLabel = NSTextField(labelWithString: "Settings")
@@ -4991,6 +5042,27 @@ class SettingsView: NSView {
         default: defaultEditorPopup.selectItem(at: 0)
         }
         addSubview(defaultEditorPopup)
+
+        syncLabel = NSTextField(labelWithString: "Sync")
+        syncLabel.font = .systemFont(ofSize: 14, weight: .medium)
+        syncLabel.textColor = ThemeManager.shared.currentTheme.text.withAlphaComponent(0.7)
+        syncLabel.frame = NSRect(x: 20, y: bounds.height - 360, width: 200, height: 20)
+        syncLabel.autoresizingMask = [.minYMargin]
+        addSubview(syncLabel)
+
+        syncSettingsButton = NSButton(title: "Configure Firestore Sync...", target: self, action: #selector(openSyncSettings))
+        syncSettingsButton.frame = NSRect(x: 20, y: bounds.height - 392, width: 220, height: 28)
+        syncSettingsButton.autoresizingMask = [.minYMargin]
+        styleTextButton(syncSettingsButton)
+        addSubview(syncSettingsButton)
+    }
+
+    private func styleTextButton(_ button: NSButton) {
+        button.contentTintColor = ThemeManager.shared.currentTheme.text
+        button.attributedTitle = NSAttributedString(
+            string: button.title,
+            attributes: [.foregroundColor: ThemeManager.shared.currentTheme.text]
+        )
     }
 
     private func createThemeButton(theme: Theme, frame: NSRect) -> NSButton {
@@ -5069,6 +5141,7 @@ class SettingsView: NSView {
 
         // Update background
         layer?.backgroundColor = theme.background.cgColor
+        appearance = theme.controlAppearance
 
         // Update title and labels
         titleLabel.textColor = theme.text
@@ -5077,6 +5150,8 @@ class SettingsView: NSView {
         toggleHotkeyLabel.textColor = theme.text.withAlphaComponent(0.6)
         workspaceLabel.textColor = theme.text.withAlphaComponent(0.7)
         defaultEditorLabel.textColor = theme.text.withAlphaComponent(0.6)
+        syncLabel.textColor = theme.text.withAlphaComponent(0.7)
+        styleTextButton(syncSettingsButton)
 
         // Update hotkey recorder views
         toggleHotkeyRecorder.backgroundColor = theme.background
@@ -5091,8 +5166,262 @@ class SettingsView: NSView {
         }
     }
 
+    @objc private func openSyncSettings() {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 540, height: 340),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Firestore Sync"
+        panel.isReleasedWhenClosed = false
+
+        let syncView = SyncSettingsView(frame: panel.contentView!.bounds)
+        syncView.autoresizingMask = [.width, .height]
+        syncView.onClose = { [weak panel] in
+            guard let panel else { return }
+            if let parent = panel.sheetParent {
+                parent.endSheet(panel)
+            } else {
+                panel.close()
+            }
+        }
+        panel.contentView = syncView
+
+        if let window {
+            window.beginSheet(panel)
+        } else {
+            panel.makeKeyAndOrderFront(nil)
+        }
+    }
+
     @objc private func donePressed() {
         onDismiss?()
+    }
+}
+
+class SyncSettingsView: NSView {
+    var onClose: (() -> Void)?
+
+    private var titleLabel: NSTextField!
+    private var statusLabel: NSTextField!
+    private var sourceLabel: NSTextField!
+    private var infoLabel: NSTextField!
+    private var enableCheckbox: NSButton!
+    private var spaceIDField: NSTextField!
+    private var importedPathLabel: NSTextField!
+    private var revealButton: NSButton!
+    private var saveButton: NSButton!
+    private var cancelButton: NSButton!
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        setupUI()
+        reloadState()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private var theme: Theme { ThemeManager.shared.currentTheme }
+
+    private func setupUI() {
+        wantsLayer = true
+        applyTheme()
+
+        titleLabel = NSTextField(labelWithString: "Firestore Sync")
+        titleLabel.font = .systemFont(ofSize: 18, weight: .semibold)
+        titleLabel.textColor = theme.text
+        titleLabel.frame = NSRect(x: 20, y: bounds.height - 42, width: 260, height: 24)
+        titleLabel.autoresizingMask = [.minYMargin]
+        addSubview(titleLabel)
+
+        statusLabel = NSTextField(wrappingLabelWithString: "")
+        statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        statusLabel.textColor = theme.text
+        statusLabel.frame = NSRect(x: 20, y: bounds.height - 82, width: bounds.width - 40, height: 34)
+        statusLabel.autoresizingMask = [.width, .minYMargin]
+        addSubview(statusLabel)
+
+        sourceLabel = NSTextField(wrappingLabelWithString: "")
+        sourceLabel.font = .systemFont(ofSize: 12)
+        sourceLabel.textColor = theme.text.withAlphaComponent(0.72)
+        sourceLabel.frame = NSRect(x: 20, y: bounds.height - 112, width: bounds.width - 40, height: 18)
+        sourceLabel.autoresizingMask = [.width, .minYMargin]
+        addSubview(sourceLabel)
+
+        infoLabel = NSTextField(wrappingLabelWithString: "")
+        infoLabel.font = .systemFont(ofSize: 11)
+        infoLabel.textColor = theme.text.withAlphaComponent(0.6)
+        infoLabel.frame = NSRect(x: 20, y: bounds.height - 145, width: bounds.width - 40, height: 32)
+        infoLabel.autoresizingMask = [.width, .minYMargin]
+        addSubview(infoLabel)
+
+        enableCheckbox = NSButton(checkboxWithTitle: "Enable Firestore sync", target: nil, action: nil)
+        enableCheckbox.font = .systemFont(ofSize: 13)
+        enableCheckbox.frame = NSRect(x: 20, y: bounds.height - 180, width: 220, height: 22)
+        enableCheckbox.autoresizingMask = [.minYMargin]
+        styleCheckbox(enableCheckbox)
+        addSubview(enableCheckbox)
+
+        let spaceLabel = NSTextField(labelWithString: "Sync Space ID")
+        spaceLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        spaceLabel.textColor = theme.text.withAlphaComponent(0.8)
+        spaceLabel.frame = NSRect(x: 20, y: bounds.height - 212, width: 120, height: 18)
+        spaceLabel.autoresizingMask = [.minYMargin]
+        addSubview(spaceLabel)
+
+        spaceIDField = NSTextField(frame: NSRect(x: 20, y: bounds.height - 240, width: bounds.width - 180, height: 24))
+        spaceIDField.autoresizingMask = [.width, .minYMargin]
+        addSubview(spaceIDField)
+
+        let generateButton = NSButton(title: "Generate", target: self, action: #selector(generateSpaceID))
+        generateButton.frame = NSRect(x: bounds.width - 150, y: bounds.height - 242, width: 60, height: 28)
+        generateButton.autoresizingMask = [.minXMargin, .minYMargin]
+        styleTextButton(generateButton)
+        addSubview(generateButton)
+
+        let copyButton = NSButton(title: "Copy", target: self, action: #selector(copySpaceID))
+        copyButton.frame = NSRect(x: bounds.width - 84, y: bounds.height - 242, width: 54, height: 28)
+        copyButton.autoresizingMask = [.minXMargin, .minYMargin]
+        styleTextButton(copyButton)
+        addSubview(copyButton)
+
+        let importButton = NSButton(title: "Import GoogleService-Info.plist...", target: self, action: #selector(importGoogleServiceInfo))
+        importButton.frame = NSRect(x: 20, y: bounds.height - 282, width: 220, height: 28)
+        importButton.autoresizingMask = [.minYMargin]
+        styleTextButton(importButton)
+        addSubview(importButton)
+
+        revealButton = NSButton(title: "Reveal Imported File", target: self, action: #selector(revealImportedGoogleServiceInfo))
+        revealButton.frame = NSRect(x: 250, y: bounds.height - 282, width: 150, height: 28)
+        revealButton.autoresizingMask = [.minYMargin]
+        styleTextButton(revealButton)
+        addSubview(revealButton)
+
+        importedPathLabel = NSTextField(wrappingLabelWithString: "")
+        importedPathLabel.font = .systemFont(ofSize: 11)
+        importedPathLabel.textColor = theme.text.withAlphaComponent(0.55)
+        importedPathLabel.frame = NSRect(x: 20, y: bounds.height - 320, width: bounds.width - 40, height: 34)
+        importedPathLabel.autoresizingMask = [.width, .minYMargin]
+        addSubview(importedPathLabel)
+
+        saveButton = NSButton(title: "Save", target: self, action: #selector(savePressed))
+        saveButton.frame = NSRect(x: bounds.width - 180, y: 16, width: 70, height: 30)
+        saveButton.autoresizingMask = [.minXMargin, .maxYMargin]
+        styleTextButton(saveButton)
+        addSubview(saveButton)
+
+        cancelButton = NSButton(title: "Close", target: self, action: #selector(closePressed))
+        cancelButton.frame = NSRect(x: bounds.width - 100, y: 16, width: 70, height: 30)
+        cancelButton.autoresizingMask = [.minXMargin, .maxYMargin]
+        styleTextButton(cancelButton)
+        addSubview(cancelButton)
+    }
+
+    private func applyTheme() {
+        appearance = theme.controlAppearance
+        layer?.backgroundColor = theme.background.cgColor
+    }
+
+    private func styleTextButton(_ button: NSButton) {
+        button.contentTintColor = theme.text
+        button.attributedTitle = NSAttributedString(
+            string: button.title,
+            attributes: [.foregroundColor: theme.text]
+        )
+    }
+
+    private func styleCheckbox(_ button: NSButton) {
+        button.contentTintColor = theme.text
+        button.attributedTitle = NSAttributedString(
+            string: button.title,
+            attributes: [.foregroundColor: theme.text]
+        )
+    }
+
+    private func reloadState() {
+        let settings = NotesManager.shared.currentSyncSettings()
+        enableCheckbox.state = settings.enabled ? .on : .off
+        if spaceIDField.stringValue.isEmpty {
+            spaceIDField.stringValue = settings.spaceID
+        }
+
+        statusLabel.stringValue = "Status: \(NotesManager.shared.syncStatusDescription())"
+        sourceLabel.stringValue = "Firebase config: \(NotesManager.shared.syncConfigurationSourceDescription())"
+
+        if let restartNotice = NotesManager.shared.syncRestartNotice() {
+            infoLabel.stringValue = restartNotice
+        } else {
+            let bundleID = Bundle.main.bundleIdentifier ?? "com.andybarenberg.WispMark"
+            infoLabel.stringValue = "Use the same Sync Space ID on each Mac. Bundle ID: \(bundleID)"
+        }
+
+        let importedURL = NotesManager.shared.importedSyncGoogleServiceInfoURL
+        importedPathLabel.stringValue = "Imported plist path: \(importedURL.path)"
+        revealButton.isEnabled = FileManager.default.fileExists(atPath: importedURL.path)
+    }
+
+    @objc private func generateSpaceID() {
+        spaceIDField.stringValue = NotesManager.shared.generateSyncSpaceID()
+    }
+
+    @objc private func copySpaceID() {
+        let value = spaceIDField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(value, forType: .string)
+    }
+
+    @objc private func importGoogleServiceInfo() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedFileTypes = ["plist"]
+        panel.prompt = "Import"
+
+        guard panel.runModal() == .OK, let selectedURL = panel.url else { return }
+
+        let didStartAccess = selectedURL.startAccessingSecurityScopedResource()
+        defer {
+            if didStartAccess {
+                selectedURL.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        do {
+            try NotesManager.shared.importSyncGoogleServiceInfo(from: selectedURL)
+            reloadState()
+        } catch {
+            showError(message: "Could not import GoogleService-Info.plist: \(error.localizedDescription)")
+        }
+    }
+
+    @objc private func revealImportedGoogleServiceInfo() {
+        let url = NotesManager.shared.importedSyncGoogleServiceInfoURL
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    @objc private func savePressed() {
+        NotesManager.shared.saveSyncSettings(
+            enabled: enableCheckbox.state == .on,
+            spaceID: spaceIDField.stringValue
+        )
+        onClose?()
+    }
+
+    @objc private func closePressed() {
+        onClose?()
+    }
+
+    private func showError(message: String) {
+        let alert = NSAlert()
+        alert.messageText = "Sync Setup Error"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.runModal()
     }
 }
 

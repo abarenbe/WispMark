@@ -27,6 +27,18 @@ struct FirestoreSyncSettings {
 
         return FirestoreSyncSettings(enabled: enabled, spaceID: spaceID)
     }
+
+    static func persist(enabled: Bool, spaceID: String) {
+        let defaults = UserDefaults.standard
+        defaults.set(enabled, forKey: enabledDefaultsKey)
+        defaults.set(spaceID.trimmingCharacters(in: .whitespacesAndNewlines), forKey: spaceIDDefaultsKey)
+    }
+
+    static func generateSpaceID() -> String {
+        let first = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        let second = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        return String((first + second).prefix(48))
+    }
 }
 
 enum FirestoreRemoteChange {
@@ -64,6 +76,78 @@ final class FirestoreSyncManager {
     private init() {}
 
     var isRunning: Bool { started }
+
+    var importedGoogleServiceInfoURL: URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
+        return appSupport
+            .appendingPathComponent("WispMark", isDirectory: true)
+            .appendingPathComponent("GoogleService-Info.plist")
+    }
+
+    var hasImportedGoogleServiceInfo: Bool {
+        FileManager.default.fileExists(atPath: importedGoogleServiceInfoURL.path)
+    }
+
+    func importGoogleServiceInfo(from sourceURL: URL) throws {
+        let fileManager = FileManager.default
+        let destination = importedGoogleServiceInfoURL
+        try fileManager.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if fileManager.fileExists(atPath: destination.path) {
+            try fileManager.removeItem(at: destination)
+        }
+        try fileManager.copyItem(at: sourceURL, to: destination)
+    }
+
+    func configurationSourceDescription() -> String {
+#if canImport(FirebaseCore) && canImport(FirebaseFirestore)
+        switch firebaseConfigurationSource() {
+        case .bundled:
+            return "Bundled GoogleService-Info.plist"
+        case .imported:
+            return "Imported GoogleService-Info.plist"
+        case .manual:
+            return "Manual Firebase defaults"
+        case .missing:
+            return "Missing Firebase config"
+        }
+#else
+        return "Firebase SDK not linked"
+#endif
+    }
+
+    func statusDescription() -> String {
+        let settings = FirestoreSyncSettings.current()
+        if !settings.enabled {
+            return "Sync is off"
+        }
+        if settings.spaceID.isEmpty {
+            return "Add a Sync Space ID"
+        }
+#if canImport(FirebaseCore) && canImport(FirebaseFirestore)
+        if firebaseConfigurationSource() == .missing {
+            return "Import GoogleService-Info.plist or add Firebase defaults"
+        }
+        if started {
+            return "Sync running for space \(settings.spaceID)"
+        }
+        return "Sync ready for space \(settings.spaceID)"
+#else
+        return "Firebase SDK not linked"
+#endif
+    }
+
+    func restartNoticeIfNeeded() -> String? {
+#if canImport(FirebaseCore) && canImport(FirebaseFirestore)
+        if FirebaseApp.app() != nil {
+            return "Firebase project changes apply on next launch."
+        }
+#endif
+        return nil
+    }
 
     func start(
         notesProvider: @escaping NotesProvider,
@@ -174,6 +258,13 @@ final class FirestoreSyncManager {
 
 #if canImport(FirebaseCore) && canImport(FirebaseFirestore)
 private extension FirestoreSyncManager {
+    enum FirebaseConfigurationSource {
+        case bundled
+        case imported
+        case manual
+        case missing
+    }
+
     struct RemoteState {
         let modifiedAt: Date
         let deleted: Bool
@@ -186,6 +277,11 @@ private extension FirestoreSyncManager {
 
         if let bundlePath = Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist"),
            let options = FirebaseOptions(contentsOfFile: bundlePath) {
+            FirebaseApp.configure(options: options)
+            return true
+        }
+
+        if let options = FirebaseOptions(contentsOfFile: importedGoogleServiceInfoURL.path) {
             FirebaseApp.configure(options: options)
             return true
         }
@@ -244,6 +340,19 @@ private extension FirestoreSyncManager {
         }
 
         return options
+    }
+
+    func firebaseConfigurationSource() -> FirebaseConfigurationSource {
+        if Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist") != nil {
+            return .bundled
+        }
+        if FileManager.default.fileExists(atPath: importedGoogleServiceInfoURL.path) {
+            return .imported
+        }
+        if firebaseOptionsFromInfoPlist() != nil {
+            return .manual
+        }
+        return .missing
     }
 
     func attachListener() {

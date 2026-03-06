@@ -2,10 +2,12 @@
 set -euo pipefail
 
 APP_NAME="WispMark"
-APP_DIR="$APP_NAME.app"
-BINARY_NAME="WispMark"
-ICON_SOURCE="logo_wispmark.png"
-APP_BUNDLE_ID="com.andybarenberg.WispMark"
+STAGING_APP_PATH="build/Install/$APP_NAME.app"
+PROJECT_PATH="WispMark-macOS.xcodeproj"
+SCHEME_NAME="WispMark"
+CONFIGURATION="${WISPMARK_CONFIGURATION:-Debug}"
+DERIVED_DATA_PATH="build/DerivedData"
+BUILT_APP_PATH="$DERIVED_DATA_PATH/Build/Products/$CONFIGURATION/$APP_NAME.app"
 APP_VERSION="${WISPMARK_VERSION:-1.0.0}"
 BUILD_NUMBER="${WISPMARK_BUILD_NUMBER:-$(date +%Y%m%d%H%M%S)}"
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -17,13 +19,24 @@ detect_sign_identity() {
         return
     fi
 
-    # Prefer a Developer ID Application identity if available.
     local detected
     detected="$(security find-identity -v -p codesigning 2>/dev/null | awk -F\" '/Developer ID Application/ {print $2; exit}')"
     if [ -n "$detected" ]; then
         echo "$detected"
     else
         echo "-"
+    fi
+}
+
+set_plist_string() {
+    local plist_path="$1"
+    local key="$2"
+    local value="$3"
+
+    if /usr/libexec/PlistBuddy -c "Print :$key" "$plist_path" >/dev/null 2>&1; then
+        /usr/libexec/PlistBuddy -c "Set :$key $value" "$plist_path"
+    else
+        /usr/libexec/PlistBuddy -c "Add :$key string $value" "$plist_path"
     fi
 }
 
@@ -34,92 +47,44 @@ else
     echo "Using signing identity: $SIGN_IDENTITY"
 fi
 
-echo "Cleaning up..."
-rm -rf "$APP_DIR"
+echo "Building Xcode target..."
+xcodebuild \
+    -project "$PROJECT_PATH" \
+    -scheme "$SCHEME_NAME" \
+    -configuration "$CONFIGURATION" \
+    -derivedDataPath "$DERIVED_DATA_PATH" \
+    CODE_SIGNING_ALLOWED=NO \
+    build
 
-echo "Creating App Bundle Structure..."
-mkdir -p "$APP_DIR/Contents/MacOS"
-mkdir -p "$APP_DIR/Contents/Resources"
-
-echo "Compiling Swift Code..."
-swiftc main.swift -o "$APP_DIR/Contents/MacOS/$BINARY_NAME" -framework Cocoa -framework Carbon -O
-
-echo "Creating Info.plist..."
-cat > "$APP_DIR/Contents/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key>
-    <string>$BINARY_NAME</string>
-    <key>CFBundleIdentifier</key>
-    <string>$APP_BUNDLE_ID</string>
-    <key>CFBundleName</key>
-    <string>$APP_NAME</string>
-    <key>CFBundleShortVersionString</key>
-    <string>$APP_VERSION</string>
-    <key>CFBundleVersion</key>
-    <string>$BUILD_NUMBER</string>
-    <key>WispMarkGitCommit</key>
-    <string>$GIT_COMMIT</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>LSUIElement</key>
-    <true/>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-</dict>
-</plist>
-EOF
-
-if [ -f "$ICON_SOURCE" ]; then
-    echo "Creating App Icon..."
-    ICONSET_DIR="WispMark.iconset"
-    mkdir -p "$ICONSET_DIR"
-
-    # Resize images
-    sips -s format png -z 16 16     "$ICON_SOURCE" --out "$ICONSET_DIR/icon_16x16.png" > /dev/null
-    sips -s format png -z 32 32     "$ICON_SOURCE" --out "$ICONSET_DIR/icon_16x16@2x.png" > /dev/null
-    sips -s format png -z 32 32     "$ICON_SOURCE" --out "$ICONSET_DIR/icon_32x32.png" > /dev/null
-    sips -s format png -z 64 64     "$ICON_SOURCE" --out "$ICONSET_DIR/icon_32x32@2x.png" > /dev/null
-    sips -s format png -z 128 128   "$ICON_SOURCE" --out "$ICONSET_DIR/icon_128x128.png" > /dev/null
-    sips -s format png -z 256 256   "$ICON_SOURCE" --out "$ICONSET_DIR/icon_128x128@2x.png" > /dev/null
-    sips -s format png -z 256 256   "$ICON_SOURCE" --out "$ICONSET_DIR/icon_256x256.png" > /dev/null
-    sips -s format png -z 512 512   "$ICON_SOURCE" --out "$ICONSET_DIR/icon_256x256@2x.png" > /dev/null
-    sips -s format png -z 512 512   "$ICON_SOURCE" --out "$ICONSET_DIR/icon_512x512.png" > /dev/null
-    sips -s format png -z 1024 1024 "$ICON_SOURCE" --out "$ICONSET_DIR/icon_512x512@2x.png" > /dev/null
-
-    # Convert to icns
-    iconutil -c icns "$ICONSET_DIR" -o "$APP_DIR/Contents/Resources/AppIcon.icns"
-    
-    # Clean up
-    rm -rf "$ICONSET_DIR"
-else
-    echo "Warning: $ICON_SOURCE not found. App will have generic icon."
+if [ ! -d "$BUILT_APP_PATH" ]; then
+    echo "Build output not found: $BUILT_APP_PATH" >&2
+    exit 1
 fi
+
+echo "Staging app bundle..."
+rm -rf "$STAGING_APP_PATH"
+mkdir -p "$(dirname "$STAGING_APP_PATH")"
+ditto "$BUILT_APP_PATH" "$STAGING_APP_PATH"
+
+INFO_PLIST="$STAGING_APP_PATH/Contents/Info.plist"
+set_plist_string "$INFO_PLIST" "CFBundleShortVersionString" "$APP_VERSION"
+set_plist_string "$INFO_PLIST" "CFBundleVersion" "$BUILD_NUMBER"
+set_plist_string "$INFO_PLIST" "WispMarkGitCommit" "$GIT_COMMIT"
 
 echo "Build metadata: version=$APP_VERSION build=$BUILD_NUMBER commit=$GIT_COMMIT"
 
-echo "Code signing app..."
+echo "Code signing staged app..."
 if [ "$SIGN_IDENTITY" = "-" ]; then
-    codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_DIR"
+    codesign --force --deep --sign "$SIGN_IDENTITY" "$STAGING_APP_PATH"
 else
-    codesign --force --deep --sign "$SIGN_IDENTITY" --options runtime --timestamp "$APP_DIR"
+    codesign --force --deep --sign "$SIGN_IDENTITY" --options runtime --timestamp "$STAGING_APP_PATH"
 fi
-
-echo "Build complete: $APP_DIR"
 
 echo "Installing to /Applications..."
+rm -rf "$INSTALL_PATH"
+ditto "$STAGING_APP_PATH" "$INSTALL_PATH"
 
-# Remove existing app if present
-if [ -d "$INSTALL_PATH" ]; then
-    rm -rf "$INSTALL_PATH"
-fi
-cp -R "$APP_DIR" "/Applications/"
-
-# Re-sign after copy to ensure final installed app has the expected signature.
+echo "Code signing installed app..."
 if [ "$SIGN_IDENTITY" = "-" ]; then
     codesign --force --deep --sign "$SIGN_IDENTITY" "$INSTALL_PATH"
 else
